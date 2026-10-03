@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="巡回管理">
+<title>巡回管理</title>
+<style>
+:root{--bg:#eef1ee;--card:#fff;--ink:#1b2a25;--sub:#5d6b66;--line:#d5dcd8;--main:#1f6f5c;--done:#e3f1ea;--warn:#b4531f}
+@media(prefers-color-scheme:dark){:root{--bg:#121816;--card:#1c2522;--ink:#e8efec;--sub:#9aa9a3;--line:#33403b;--main:#4fb89d;--done:#1d3329;--warn:#e08a55}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,"Hiragino Sans",sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:640px;margin:0 auto;padding:12px}
+h1{font-size:22px;margin:8px 0}
+h2{font-size:17px;margin:16px 0 6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:10px 0}
+.card.done{background:var(--done)}
+.next{border:2px solid var(--main)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+button,select,.btn{font:inherit;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button.p{background:var(--main);color:#fff;border-color:var(--main)}
+button.on{background:var(--main);color:#fff;border-color:var(--main)}
+button.ng.on{background:var(--warn);border-color:var(--warn)}
+select{width:100%}
+textarea,input[type=text]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+.stats{display:flex;gap:8px}.stats div{flex:1;text-align:center}.stats b{display:block;font-size:24px}
+.sub{color:var(--sub);font-size:14px}
+.hide{display:none}
+.seg{display:flex;gap:6px;flex-wrap:wrap}
+.modal{position:fixed;inset:0;background:var(--bg);overflow:auto;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+a.btn{text-decoration:none}
+.badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--sub);vertical-align:2px}
+.badge.ok{background:var(--main);border-color:var(--main);color:#fff}
+label.btn{display:inline-block}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+/* ============================================================
+ * 巡回管理アプリ（個人利用）
+ * 【データの取り扱い】
+ *  - 住所を含むデータはこの端末のブラウザ(localStorage)にのみ保存されます。サーバー送信はありません。
+ *  - 写真ファイルは保存せず、「撮影したか」の状態のみ保存します。
+ *  - 端末共有時やSafariの履歴/サイトデータ削除でデータが消える/見られる可能性があります。
+ *    バックアップJSONには住所が含まれるため、保管先・送付先に注意してください。
+ *  - 地点情報(SPOTS_KEY)と巡回記録(RECORDS_KEY)は別キーで管理し、CSV再読込でも記録を保持します。
+ * ============================================================ */
+const SPOTS_KEY='patrol.spots.v1', RECORDS_KEY='patrol.records.v1', PREF_KEY='patrol.pref.v1', GEO_KEY='patrol.geo.v1', ROUTES_KEY='patrol.routes.v1';
+const CSV_URL='spots.csv'; // index.html と同じ場所に置いたCSVを読み込む
+const DIRS=['正面','右側','左側','裏面'], PHOTO=['未確認','撮影済み','撮影不可'], CLEAN=['未確認','清掃済み','清掃不要'];
+const TRAVEL_MODES={driving:'車',walking:'徒歩',transit:'公共交通',bicycling:'自転車'}; // 拡張しやすい移動モード定義
+const load=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
+const save=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+let spots=load(SPOTS_KEY,[]);           // [{id,name,address,area,num,order}]  固定情報のみ
+let records=load(RECORDS_KEY,{});       // {id:{history:[YYYY-MM-DD],clean,photos:[..4],memo}}
+let geo=load(GEO_KEY,{});               // 住所→座標のキャッシュ（ルート作成用。外部APIで取得）
+let routes=load(ROUTES_KEY,{});         // {エリア:{station,order:[id],km,miss,at}} 最適化した巡回順
+let pref=Object.assign({area:'',mode:'bicycling',onlyUnvisited:false,detail:null},load(PREF_KEY,{}));
+const savePref=()=>save(PREF_KEY,pref);
+if(!pref.v2){pref.mode='bicycling';pref.v2=1;savePref()} // 初期値を自転車に
+const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const rec=id=>records[id]||(records[id]={history:[],clean:0,photos:[0,0,0,0],memo:''});
+const doneToday=id=>(records[id]?.history||[]).includes(today());
+const everDone=id=>(records[id]?.history||[]).length>0;
+// 「未完了」＝今日未巡回（巡回周期の再開用）。履歴は消さず日付を追加するだけ。
+const pending=id=>!doneToday(id);
+
+/* ---- CSV ---- */
+function parseCSV(text){
+  const rows=[];let r=[],c='',q=false;text=text.replace(/^\uFEFF/,'');
+  for(let i=0;i<text.length;i++){const ch=text[i];
+    if(q){if(ch=='"'){if(text[i+1]=='"'){c+='"';i++}else q=false}else c+=ch}
+    else if(ch=='"')q=true; else if(ch==','){r.push(c);c=''}
+    else if(ch=='\n'||ch=='\r'){if(ch=='\r'&&text[i+1]=='\n')i++;r.push(c);rows.push(r);r=[];c=''}
+    else c+=ch}
+  if(c||r.length){r.push(c);rows.push(r)}
+  return rows.filter(x=>x.some(v=>v.trim()));
+}
+function importCSV(text,silent){
+  const rows=parseCSV(text).map(r=>r.map(v=>v.trim()));
+  if(rows.length&&/識別番号|id/i.test(rows[0][0]))rows.shift();
+  const list=[];const seen=new Set();
+  rows.forEach(r=>{const id=r[0];if(!id||seen.has(id))return;seen.add(id);
+    const m=id.match(/^(.*?)[-－ー‐](\d+)$/);
+    list.push({id,name:r[1]||'',address:r[2]||'',area:m?m[1]:id,num:m?+m[2]:null,order:list.length})});
+  if(!list.length){alert('読み込める行がありません。');return}
+  const old=new Set(spots.map(s=>s.id)), keep=list.filter(s=>old.has(s.id)).length;
+  if(!silent&&!confirm(`${list.length}地点を読み込みます（既存と一致:${keep}件）。\n巡回記録は消えません。続けますか？`))return;
+  spots=list;save(SPOTS_KEY,spots);render();
+}
+
+/* ---- ナビ（住所のみ。緯度経度は不使用） ---- */
+function navURL(s){
+  // Google Maps Directions URL。origin省略=現在地。iPhoneはGoogleマップアプリがあればアプリで、無ければSafariで開く。
+  return 'https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(s.address||s.name)+'&travelmode='+pref.mode;
+}
+
+/* ---- 操作 ---- */
+function toggleDone(id){const h=rec(id).history;const t=today();
+  const i=h.indexOf(t);if(i>=0)h.splice(i,1);else{h.push(t);h.sort().reverse()}
+  save(RECORDS_KEY,records);render()}
+function setClean(id,v){rec(id).clean=v;save(RECORDS_KEY,records);render()}
+function setPhoto(id,i,v){rec(id).photos[i]=v;save(RECORDS_KEY,records);render()}
+function allPhotos(id){rec(id).photos=[1,1,1,1];save(RECORDS_KEY,records);render()}
+function setMemo(id,v){rec(id).memo=v;save(RECORDS_KEY,records)}
+
+/* ---- CSV読み込み（同じGitHub Pages上の spots.csv を取得） ---- */
+async function loadCSV(auto){
+  try{
+    const res=await fetch(CSV_URL+'?t='+Date.now(),{cache:'no-store'});
+    if(!res.ok)throw new Error(res.status);
+    importCSV(await res.text(),auto);
+  }catch(e){alert('spots.csv を読み込めませんでした。\nGitHub Pages上で開いているか、spots.csv が index.html と同じ場所にあるか確認してください。')}
+}
+
+/* ---- バックアップ（クリップボードの文字列） ---- */
+function backupText(){return JSON.stringify({version:2,exportedAt:new Date().toISOString(),spots,records,routes})}
+async function copyBackup(){
+  const t=backupText();
+  try{await navigator.clipboard.writeText(t);alert('バックアップをクリップボードにコピーしました。メモアプリなどに貼り付けて保管してください。')}
+  catch(e){const b=document.getElementById('bk');b.value=t;b.focus();b.select();b.setSelectionRange(0,t.length);alert('自動コピーできませんでした。表示された文字列を全選択してコピーしてください。')}
+}
+function restoreBackup(){
+  const t=document.getElementById('bk').value.trim();
+  try{const d=JSON.parse(t);if(!Array.isArray(d.spots)||typeof d.records!=='object')throw 0;
+    if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))return;
+    spots=d.spots;records=d.records;routes=d.routes||{};
+    save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);render();alert('復元しました。');
+  }catch(e){alert('バックアップの文字列が正しくありません。全体をコピーできているか確認してください。')}
+}
+
+/* ---- 最適ルート（駅→最近傍法＋2-opt） ----
+ * 注意: ルート作成時のみ、住所を国土地理院の住所検索API、駅名をOpenStreetMap(Nominatim)、
+ *       最寄り駅をHeartRails Express APIへ送信します。座標は端末内にキャッシュされます。
+ * 距離は直線距離での近似です（実際の自転車ルートではありません）。 */
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function geocode(addr){
+  try{const r=await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q='+encodeURIComponent(addr));
+    const c=(await r.json())[0]?.geometry?.coordinates;return c?{lat:c[1],lng:c[0]}:null}catch(e){return null}
+}
+async function stationByName(name){
+  const q=/駅$/.test(name)?name:name+'駅';
+  const r=await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&accept-language=ja&q='+encodeURIComponent(q));
+  const j=await r.json();if(!j[0])throw new Error('駅が見つかりません: '+q);
+  return{name:q,lat:+j[0].lat,lng:+j[0].lon};
+}
+async function nearestStation(c){
+  const r=await fetch(`https://express.heartrails.com/api/json?method=getStations&x=${c.lng}&y=${c.lat}`);
+  const st=(await r.json()).response.station?.[0];if(!st)throw new Error('最寄り駅を取得できませんでした。駅名を入力してください。');
+  return{name:st.name+'駅',lat:+st.y,lng:+st.x};
+}
+function dist(a,b){const R=6371,t=Math.PI/180,dl=(b.lat-a.lat)*t,dn=(b.lng-a.lng)*t;
+  const h=Math.sin(dl/2)**2+Math.cos(a.lat*t)*Math.cos(b.lat*t)*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+function optimize(start,items){
+  const rest=items.slice(),P=[{p:start}];
+  while(rest.length){const cur=P[P.length-1].p;let bi=0,bd=Infinity;
+    rest.forEach((x,i)=>{const d=dist(cur,x.p);if(d<bd){bd=d;bi=i}});P.push(rest.splice(bi,1)[0])}
+  for(let k=0,imp=true;imp&&k<100;k++){imp=false;
+    for(let i=1;i<P.length-1;i++)for(let j=i+1;j<P.length;j++){
+      const a=P[i-1].p,b=P[i].p,c=P[j].p,d=P[j+1]?.p;
+      if(dist(a,b)+(d?dist(c,d):0)-dist(a,c)-(d?dist(b,d):0)>1e-9){P.splice(i,j-i+1,...P.slice(i,j+1).reverse());imp=true}}}
+  return P.slice(1);
+}
+async function makeRoute(){
+  const a=pref.area;if(!a||window._busy)return;window._busy=1;
+  const st=t=>{const e=document.getElementById('st');if(e)e.textContent=t};
+  try{
+    const list=ordSpots().filter(s=>s.area===a),miss=[];
+    for(let i=0;i<list.length;i++){const s=list[i];st(`住所を位置情報に変換中 ${i+1}/${list.length}`);
+      if(!geo[s.address]){const p=await geocode(s.address);if(p){geo[s.address]=p;save(GEO_KEY,geo);await sleep(150)}}
+      if(!geo[s.address])miss.push(s.id)}
+    const items=list.filter(s=>geo[s.address]).map(s=>({id:s.id,p:geo[s.address]}));
+    if(!items.length)throw new Error('住所を位置情報に変換できませんでした。');
+    const manual=(document.getElementById('stn').value||'').trim();
+    st('基点の駅を探しています…');
+    const c={lat:items.reduce((t,x)=>t+x.p.lat,0)/items.length,lng:items.reduce((t,x)=>t+x.p.lng,0)/items.length};
+    const station=manual?await stationByName(manual):await nearestStation(c);
+    const path=optimize(station,items);
+    let km=0,cur=station;path.forEach(x=>{km+=dist(cur,x.p);cur=x.p});
+    routes[a]={station:{...station,manual},order:[...path.map(x=>x.id),...miss],km,miss,at:today()};
+    save(ROUTES_KEY,routes);
+  }catch(e){alert('ルートを作成できませんでした。\n'+e.message)}
+  window._busy=0;render();
+}
+function resetRoute(){delete routes[pref.area];save(ROUTES_KEY,routes);render()}
+// 表示順：エリアはCSV登場順、エリア内は最適化済みならその順、未作成ならCSV順
+function orderIdx(s){const o=routes[s.area]?.order;const i=o?o.indexOf(s.id):-1;return i<0?1e6+s.order:i}
+function ordSpots(){const ar=areas();return spots.slice().sort((x,y)=>ar.indexOf(x.area)-ar.indexOf(y.area)||orderIdx(x)-orderIdx(y))}
+
+/* ---- 画面 ---- */
+function areas(){return [...new Set(spots.map(s=>s.area))]}
+function visible(){let l=ordSpots().filter(s=>!pref.area||s.area===pref.area);
+  return pref.onlyUnvisited?l.filter(s=>pending(s.id)):l}
+const badge=d=>`<span class="badge ${d?'ok':''}">${d?'巡回済み':'未巡回'}</span>`;
+function spotCard(s,isNext){
+  const d=doneToday(s.id);
+  return `<div class="card ${d?'done':''} ${isNext?'next':''}">
+  <b>${d?'✓ ':''}${esc(s.id)} ${esc(s.name)}</b> ${badge(d)}
+  <div class="sub">${esc(s.address)}</div>
+  <div class="row">
+   <a class="btn" href="${navURL(s)}" target="_blank" rel="noopener">ナビ</a>
+   <button class="${d?'on':'p'}" onclick="toggleDone('${esc(s.id)}')">${d?'取り消す':'巡回済みにする'}</button>
+   <button onclick="openDetail('${esc(s.id)}')">詳細</button></div></div>`;
+}
+function openDetail(id){pref.detail=id;savePref();render();scrollTo(0,0)}
+function closeDetail(){pref.detail=null;savePref();render()}
+function detailHTML(s){
+  const r=rec(s.id),d=doneToday(s.id);
+  return `<div class="modal"><main>
+  <button onclick="closeDetail()">← 戻る</button>
+  <h1>${esc(s.id)}</h1><div><b>${esc(s.name)}</b> ${badge(d)}</div><div class="sub">${esc(s.address)}</div>
+  <div class="row"><a class="btn p" href="${navURL(s)}" target="_blank" rel="noopener" style="background:var(--main);color:#fff;text-decoration:none">Googleマップでナビ</a>
+  <button class="${d?'on':'p'}" onclick="toggleDone('${esc(s.id)}')">${d?'取り消す':'巡回済みにする'}</button></div>
+  <h2>清掃</h2><div class="seg">${CLEAN.map((n,i)=>`<button class="${r.clean===i?'on':''}" onclick="setClean('${esc(s.id)}',${i})">${n}</button>`).join('')}</div>
+  <h2>写真（撮影状況のみ記録）</h2>
+  <button onclick="allPhotos('${esc(s.id)}')">4方向すべて撮影済み</button>
+  ${DIRS.map((n,di)=>`<div class="card"><b>${n}</b><div class="seg" style="margin-top:6px">${PHOTO.map((p,pi)=>`<button class="${r.photos[di]===pi?'on':''} ${pi===2?'ng':''}" onclick="setPhoto('${esc(s.id)}',${di},${pi})">${p}</button>`).join('')}</div></div>`).join('')}
+  ${r.photos.includes(2)?'<div class="sub">撮影不可の理由は下のメモに書いてください。</div>':''}
+  <h2>メモ</h2><textarea rows="4" oninput="setMemo('${esc(s.id)}',this.value)" placeholder="例：裏側に車が停まっていて撮影できなかった">${esc(r.memo)}</textarea>
+  <h2>巡回履歴</h2>${r.history.length?r.history.map(h=>`<div>${h.replace(/-/g,'/')}</div>`).join(''):'<div class="sub">まだ履歴がありません</div>'}
+  </main></div>`;
+}
+function render(){
+  const app=document.getElementById('app');
+  const list=visible(),scope=ordSpots().filter(s=>!pref.area||s.area===pref.area);
+  const total=scope.length,dn=scope.filter(s=>doneToday(s.id)).length;
+  const next=scope.find(s=>pending(s.id));
+  let html=`<h1>巡回管理</h1>
+  <div class="card"><div class="stats"><div><b>${total}</b>${pref.area?'エリア地点':'登録地点'}</div><div><b>${dn}</b>本日巡回済み</div><div><b>${total-dn}</b>本日残り</div></div></div>
+  <select onchange="pref.area=this.value;savePref();render()"><option value="">すべてのエリア</option>${areas().map(a=>`<option ${a===pref.area?'selected':''}>${esc(a)}</option>`).join('')}</select>
+  <div class="row"><label class="sub"><input type="checkbox" ${pref.onlyUnvisited?'checked':''} onchange="pref.onlyUnvisited=this.checked;savePref();render()"> 未巡回のみ表示（再開）</label>
+  <select style="width:auto" onchange="pref.mode=this.value;savePref();render()">${Object.entries(TRAVEL_MODES).map(([k,v])=>`<option value="${k}" ${k===pref.mode?'selected':''}>${v}</option>`).join('')}</select></div>`;
+  if(pref.area){const r=routes[pref.area];
+    html+=`<div class="card"><b>最適ルート（${esc(pref.area)}）</b>
+    <div class="sub">${r?.order?`基点：${esc(r.station.name)} ／ 直線距離の合計 約${r.km.toFixed(1)}km${r.miss?.length?` ／ 位置不明：${esc(r.miss.join(', '))}`:''}`:'現在はCSVの順です。'}</div>
+    <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
+    <div class="row"><button class="p" onclick="makeRoute()">駅から最適ルートを作る</button>${r?.order?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
+    <div class="sub" id="st"></div></div>`}
+  if(!spots.length)html+=`<div class="card">地点がありません。下の「地点リストを更新」を押してください。</div>`;
+  if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
+  else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
+  const groups={};list.forEach(s=>(groups[s.area]=groups[s.area]||[]).push(s));
+  Object.entries(groups).forEach(([a,l])=>{html+=`<h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')});
+  html+=`<h2>データ管理</h2><div class="card">
+   <button onclick="loadCSV(false)">地点リストを更新（spots.csv）</button>
+   <div class="row"><button onclick="copyBackup()">バックアップをコピー</button><button onclick="restoreBackup()">貼り付けた文字列から復元</button></div>
+   <textarea id="bk" rows="3" style="margin-top:8px" placeholder="復元するときは、バックアップの文字列をここに貼り付けてください"></textarea>
+   <div class="sub" style="margin-top:8px">データはこの端末内のみに保存されます。機種変更前に必ずバックアップをコピーしてメモ等に保管してください。</div></div>`;
+  const ds=pref.detail&&spots.find(s=>s.id===pref.detail);
+  app.innerHTML=html+(ds?detailHTML(ds):'');
+}
+render();
+if(!spots.length)loadCSV(true); // 初回起動時はspots.csvを自動で読み込む
+</script>
+</body>
+</html>
