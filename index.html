@@ -48,7 +48,6 @@ label.btn{display:inline-block}
  *  - 地点情報(SPOTS_KEY)と巡回記録(RECORDS_KEY)は別キーで管理し、CSV再読込でも記録を保持します。
  * ============================================================ */
 const SPOTS_KEY='patrol.spots.v1', RECORDS_KEY='patrol.records.v1', PREF_KEY='patrol.pref.v1', GEO_KEY='patrol.geo.v1', ROUTES_KEY='patrol.routes.v1';
-const CSV_URL='spots.csv'; // index.html と同じ場所に置いたCSVを読み込む
 const DIRS=['正面','右側','左側','裏面'], PHOTO=['未確認','撮影済み','撮影不可'], CLEAN=['未確認','清掃済み','清掃不要'];
 const TRAVEL_MODES={driving:'車',walking:'徒歩',transit:'公共交通',bicycling:'自転車'}; // 拡張しやすい移動モード定義
 const load=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
@@ -107,13 +106,11 @@ function setPhoto(id,i,v){rec(id).photos[i]=v;save(RECORDS_KEY,records);render()
 function allPhotos(id){rec(id).photos=[1,1,1,1];save(RECORDS_KEY,records);render()}
 function setMemo(id,v){rec(id).memo=v;save(RECORDS_KEY,records)}
 
-/* ---- CSV読み込み（同じGitHub Pages上の spots.csv を取得） ---- */
-async function loadCSV(auto){
-  try{
-    const res=await fetch(CSV_URL+'?t='+Date.now(),{cache:'no-store'});
-    if(!res.ok)throw new Error(res.status);
-    importCSV(await res.text(),auto);
-  }catch(e){alert('spots.csv を読み込めませんでした。\nGitHub Pages上で開いているか、spots.csv が index.html と同じ場所にあるか確認してください。')}
+/* ---- CSV登録（CSVの中身を貼り付け。ファイルはGitHubに置かない） ---- */
+function importCSVText(){
+  const t=document.getElementById('csvin').value;
+  if(!t.trim()){alert('CSVの文字列を貼り付けてください。');return}
+  importCSV(t);
 }
 
 /* ---- バックアップ（クリップボードの文字列） ---- */
@@ -239,13 +236,15 @@ function render(){
     <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
     <div class="row"><button class="p" onclick="makeRoute()">駅から最適ルートを作る</button>${r?.order?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
     <div class="sub" id="st"></div></div>`}
-  if(!spots.length)html+=`<div class="card">地点がありません。下の「地点リストを更新」を押してください。</div>`;
+  if(!spots.length)html+=`<div class="card">地点がありません。下の「データ管理」でCSVの中身を貼り付けて登録してください。</div>`;
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
   else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
   const groups={};list.forEach(s=>(groups[s.area]=groups[s.area]||[]).push(s));
   Object.entries(groups).forEach(([a,l])=>{html+=`<h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')});
   html+=`<h2>データ管理</h2><div class="card">
-   <button onclick="loadCSV(false)">地点リストを更新（spots.csv）</button>
+   <textarea id="csvin" rows="3" placeholder="CSVの中身（識別番号,名称,住所）を貼り付け"></textarea>
+   <div class="row"><button class="p" onclick="importCSVText()">貼り付けたCSVで地点を登録</button></div>
+   <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
    <div class="row"><button onclick="copyBackup()">バックアップをコピー</button><button onclick="restoreBackup()">貼り付けた文字列から復元</button></div>
    <textarea id="bk" rows="3" style="margin-top:8px" placeholder="復元するときは、バックアップの文字列をここに貼り付けてください"></textarea>
    <div class="sub" style="margin-top:8px">データはこの端末内のみに保存されます。機種変更前に必ずバックアップをコピーしてメモ等に保管してください。</div></div>`;
@@ -253,7 +252,6 @@ function render(){
   app.innerHTML=html+(ds?detailHTML(ds):'');
 }
 render();
-if(!spots.length)loadCSV(true); // 初回起動時はspots.csvを自動で読み込む
 </script>
 </body>
 </html>
