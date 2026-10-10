@@ -23,7 +23,7 @@ button.p{background:var(--main);color:#fff;border-color:var(--main)}
 button.on{background:var(--main);color:#fff;border-color:var(--main)}
 button.ng.on{background:var(--warn);border-color:var(--warn)}
 select{width:100%}
-textarea,input[type=text]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+textarea,input[type=text],input[type=number]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
 .stats{display:flex;gap:8px}.stats div{flex:1;text-align:center}.stats b{display:block;font-size:24px}
 .sub{color:var(--sub);font-size:14px}
 .hide{display:none}
@@ -194,20 +194,31 @@ async function makePlan(){
   window._busy=0;render();
 }
 /* ---- 手動ルート：チェックで回る地点を選び、▲▼で順番を決める（iPhoneで確実に動くようドラッグは使わない） ---- */
+function normEdit(){editList=[...editList.filter(e=>e.on),...editList.filter(e=>!e.on)]} // 選択済みを上に（上から巡回順）
 function startEdit(){
   const a=pref.area,r=routes[a],pt=r?.plan&&r.plan.at===today();
   editList=ordSpots().filter(s=>s.area===a).map(s=>({id:s.id,on:pt?r.plan.ids.includes(s.id):pending(s.id)}));
-  render();
+  normEdit();render();
 }
-function moveEdit(i,d){const j=Math.max(0,Math.min(editList.length-1,i+d));const [x]=editList.splice(i,1);editList.splice(j,0,x);render()}
+function editAll(on){editList.forEach(e=>e.on=on);normEdit();render()}
+function moveEdit(i,d){const k=editList.filter(x=>x.on).length;const j=Math.max(0,Math.min(k-1,i+d));const [x]=editList.splice(i,1);editList.splice(j,0,x);render()}
+// 番号入力：その巡回順に移動（未選択の地点なら選択に追加）。空欄/0なら対象から外す
+function setPos(i,v){
+  const e=editList[i];v=parseInt(v);
+  if(!v||v<1){e.on=false;normEdit();render();return}
+  editList.splice(i,1);e.on=true;
+  const k=editList.filter(x=>x.on).length;
+  editList.splice(Math.min(v-1,k),0,e);normEdit();render();
+}
 function editHTML(){
   const sp=Object.fromEntries(spots.map(s=>[s.id,s]));
   return `<div class="card"><b>ルートを手動で決める</b>
-  <div class="sub">チェックした地点が「巡回プラン」になります。▲▼で順番を変えます（⤒は先頭へ）。</div>
-  ${editList.map((e,i)=>{const s=sp[e.id]||{};return `<div class="row" style="align-items:center;flex-wrap:nowrap;border-top:1px solid var(--line);padding-top:6px">
-   <input type="checkbox" ${e.on?'checked':''} onchange="editList[${i}].on=this.checked;render()" style="width:22px;height:22px;flex:none">
+  <div class="sub">左の番号欄に巡回順を入力するとその順番に移動します（空欄にすると対象から外れます）。▲▼⤒でも動かせます。</div>
+  <div class="row"><button onclick="editAll(true)">すべて選択</button><button onclick="editAll(false)">すべて解除</button></div>
+  ${editList.map((e,i)=>{const s=sp[e.id]||{};return `<div class="row" style="align-items:center;flex-wrap:nowrap;border-top:1px solid var(--line);padding-top:6px;${e.on?'':'opacity:.6'}">
+   <input type="number" inputmode="numeric" min="1" placeholder="–" value="${e.on?i+1:''}" onchange="setPos(${i},this.value)" style="width:58px;flex:none;text-align:center">
    <div style="flex:1;min-width:0"><b>${esc(e.id)}</b> ${esc(s.name)}${doneToday(e.id)?' <span class="badge ok">巡回済み</span>':''}<div class="sub">${esc(s.address)}</div></div>
-   <button onclick="moveEdit(${i},-9999)">⤒</button><button onclick="moveEdit(${i},-1)">▲</button><button onclick="moveEdit(${i},1)">▼</button></div>`}).join('')}
+   ${e.on?`<button onclick="moveEdit(${i},-9999)">⤒</button><button onclick="moveEdit(${i},-1)">▲</button><button onclick="moveEdit(${i},1)">▼</button>`:''}</div>`}).join('')}
   <div class="row"><button class="p" onclick="saveEdit()">このルートで決定</button><button onclick="editList=null;render()">キャンセル</button></div></div>`;
 }
 function saveEdit(){
@@ -276,6 +287,7 @@ function render(){
     <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
     <div class="row"><button class="p" onclick="makePlan()">駅から往復ルートを作る</button><button onclick="startEdit()">ルートを手動で決める</button>${r?.station?`<a class="btn" href="${stationNav(r.station)}" target="_blank" rel="noopener">駅へ戻るナビ</a>`:''}${pl?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
     <div class="sub" id="st"></div></div>${editList?editHTML():''}`}
+  else if(spots.length)html+=`<div class="card sub">エリアを選ぶと「巡回プラン」（往復ルート作成・ルートを手動で決める）が使えます。</div>`;
   if(!spots.length)html+=`<div class="card">地点がありません。下の「データ管理」でCSVの中身を貼り付けて登録してください。</div>`;
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
   else if(pt)html+=`<div class="card"><b>🎉 巡回プラン完了</b><div class="sub">最後は駅へ戻りましょう。続けて回る場合は、軒数を選んで再度ルートを作成できます。</div>${pr.station?`<div class="row"><a class="btn p" href="${stationNav(pr.station)}" target="_blank" rel="noopener">${esc(pr.station.name)}へ戻るナビ</a></div>`:''}</div>`;
