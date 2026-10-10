@@ -30,6 +30,7 @@ textarea,input[type=text]{width:100%;font:inherit;padding:8px;border-radius:8px;
 .seg{display:flex;gap:6px;flex-wrap:wrap}
 .modal{position:fixed;inset:0;background:var(--bg);overflow:auto;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
 a.btn{text-decoration:none}
+.btn.p{background:var(--main);color:#fff;border-color:var(--main)}
 .badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--sub);vertical-align:2px}
 .badge.ok{background:var(--main);border-color:var(--main);color:#fff}
 label.btn{display:inline-block}
@@ -54,6 +55,7 @@ const load=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){re
 const save=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
 let spots=load(SPOTS_KEY,[]);           // [{id,name,address,area,num,order}]  固定情報のみ
 let records=load(RECORDS_KEY,{});       // {id:{history:[YYYY-MM-DD],clean,photos:[..4],memo}}
+let editList=null;                      // 手動ルート編集中の一時データ [{id,on}]
 let geo=load(GEO_KEY,{});               // 住所→座標のキャッシュ（ルート作成用。外部APIで取得）
 let routes=load(ROUTES_KEY,{});         // {エリア:{station,order:[id],km,miss,at}} 最適化した巡回順
 let pref=Object.assign({area:'',mode:'bicycling',onlyUnvisited:false,detail:null},load(PREF_KEY,{}));
@@ -151,17 +153,20 @@ async function nearestStation(c){
 }
 function dist(a,b){const R=6371,t=Math.PI/180,dl=(b.lat-a.lat)*t,dn=(b.lng-a.lng)*t;
   const h=Math.sin(dl/2)**2+Math.cos(a.lat*t)*Math.cos(b.lat*t)*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
-function optimize(start,items){
+function optimize(start,items,loop){
   const rest=items.slice(),P=[{p:start}];
   while(rest.length){const cur=P[P.length-1].p;let bi=0,bd=Infinity;
     rest.forEach((x,i)=>{const d=dist(cur,x.p);if(d<bd){bd=d;bi=i}});P.push(rest.splice(bi,1)[0])}
   for(let k=0,imp=true;imp&&k<100;k++){imp=false;
     for(let i=1;i<P.length-1;i++)for(let j=i+1;j<P.length;j++){
-      const a=P[i-1].p,b=P[i].p,c=P[j].p,d=P[j+1]?.p;
+      const a=P[i-1].p,b=P[i].p,c=P[j].p,d=P[j+1]?.p||(loop?start:null);
       if(dist(a,b)+(d?dist(c,d):0)-dist(a,c)-(d?dist(b,d):0)>1e-9){P.splice(i,j-i+1,...P.slice(i,j+1).reverse());imp=true}}}
   return P.slice(1);
 }
-async function makeRoute(){
+const stationNav=st=>'https://www.google.com/maps/dir/?api=1&destination='+st.lat+','+st.lng+'&travelmode='+pref.mode;
+function planNo(sp){const p=routes[sp.area]?.plan;const i=p&&p.at===today()?p.ids.indexOf(sp.id):-1;return i<0?'':`<span class="badge">巡回${i+1}</span>`}
+// 巡回プラン：未巡回の地点から基点駅に近い順にN軒を選び、駅→各地点→駅の往復で巡回順を最適化する
+async function makePlan(){
   const a=pref.area;if(!a||window._busy)return;window._busy=1;
   const st=t=>{const e=document.getElementById('st');if(e)e.textContent=t};
   try{
@@ -174,13 +179,45 @@ async function makeRoute(){
     const manual=(document.getElementById('stn').value||'').trim();
     st('基点の駅を探しています…');
     const c={lat:items.reduce((t,x)=>t+x.p.lat,0)/items.length,lng:items.reduce((t,x)=>t+x.p.lng,0)/items.length};
-    const station=manual?await stationByName(manual):await nearestStation(c);
-    const path=optimize(station,items);
-    let km=0,cur=station;path.forEach(x=>{km+=dist(cur,x.p);cur=x.p});
-    routes[a]={station:{...station,manual},order:[...path.map(x=>x.id),...miss],km,miss,at:today()};
+    const prev=routes[a]?.station;
+    const station=(prev&&prev.manual===manual)?prev:(manual?await stationByName(manual):await nearestStation(c));
+    const n=+(document.getElementById('cnt').value)||0;
+    const cand=items.filter(x=>pending(x.id));
+    if(!cand.length)throw new Error('未巡回の地点がありません。');
+    const pick=n>0?cand.slice().sort((x,y)=>dist(station,x.p)-dist(station,y.p)).slice(0,n):cand;
+    const path=optimize(station,pick,true);
+    let km=0,cur=station;path.forEach(x=>{km+=dist(cur,x.p);cur=x.p});km+=dist(cur,station);
+    const ids=path.map(x=>x.id);
+    routes[a]={station:{name:station.name,lat:station.lat,lng:station.lng,manual},order:[...ids,...list.map(s=>s.id).filter(id=>!ids.includes(id))],plan:{ids,km,at:today()},miss};
     save(ROUTES_KEY,routes);
   }catch(e){alert('ルートを作成できませんでした。\n'+e.message)}
   window._busy=0;render();
+}
+/* ---- 手動ルート：チェックで回る地点を選び、▲▼で順番を決める（iPhoneで確実に動くようドラッグは使わない） ---- */
+function startEdit(){
+  const a=pref.area,r=routes[a],pt=r?.plan&&r.plan.at===today();
+  editList=ordSpots().filter(s=>s.area===a).map(s=>({id:s.id,on:pt?r.plan.ids.includes(s.id):pending(s.id)}));
+  render();
+}
+function moveEdit(i,d){const j=Math.max(0,Math.min(editList.length-1,i+d));const [x]=editList.splice(i,1);editList.splice(j,0,x);render()}
+function editHTML(){
+  const sp=Object.fromEntries(spots.map(s=>[s.id,s]));
+  return `<div class="card"><b>ルートを手動で決める</b>
+  <div class="sub">チェックした地点が「巡回プラン」になります。▲▼で順番を変えます（⤒は先頭へ）。</div>
+  ${editList.map((e,i)=>{const s=sp[e.id]||{};return `<div class="row" style="align-items:center;flex-wrap:nowrap;border-top:1px solid var(--line);padding-top:6px">
+   <input type="checkbox" ${e.on?'checked':''} onchange="editList[${i}].on=this.checked;render()" style="width:22px;height:22px;flex:none">
+   <div style="flex:1;min-width:0"><b>${esc(e.id)}</b> ${esc(s.name)}${doneToday(e.id)?' <span class="badge ok">巡回済み</span>':''}<div class="sub">${esc(s.address)}</div></div>
+   <button onclick="moveEdit(${i},-9999)">⤒</button><button onclick="moveEdit(${i},-1)">▲</button><button onclick="moveEdit(${i},1)">▼</button></div>`}).join('')}
+  <div class="row"><button class="p" onclick="saveEdit()">このルートで決定</button><button onclick="editList=null;render()">キャンセル</button></div></div>`;
+}
+function saveEdit(){
+  const a=pref.area,on=editList.filter(e=>e.on).map(e=>e.id);
+  if(!on.length){alert('回る地点を1つ以上選んでください。');return}
+  const r=routes[a]||{},sp=Object.fromEntries(spots.map(s=>[s.id,s]));
+  let km=null; // 基点駅があり座標が取得済みなら往復距離の目安を出す
+  if(r.station&&on.every(id=>geo[sp[id]?.address])){km=0;let cur=r.station;on.forEach(id=>{const p=geo[sp[id].address];km+=dist(cur,p);cur=p});km+=dist(cur,r.station)}
+  routes[a]={...r,order:[...on,...editList.map(e=>e.id).filter(id=>!on.includes(id))],plan:{ids:on,km,at:today(),manual:true}};
+  save(ROUTES_KEY,routes);editList=null;render();
 }
 function resetRoute(){delete routes[pref.area];save(ROUTES_KEY,routes);render()}
 // 表示順：エリアはCSV登場順、エリア内は最適化済みならその順、未作成ならCSV順
@@ -195,7 +232,7 @@ const badge=d=>`<span class="badge ${d?'ok':''}">${d?'巡回済み':'未巡回'}
 function spotCard(s,isNext){
   const d=doneToday(s.id);
   return `<div class="card ${d?'done':''} ${isNext?'next':''}">
-  <b>${d?'✓ ':''}${esc(s.id)} ${esc(s.name)}</b> ${badge(d)}
+  <b>${d?'✓ ':''}${esc(s.id)} ${esc(s.name)}</b> ${badge(d)} ${planNo(s)}
   <div class="sub">${esc(s.address)}</div>
   <div class="row">
    <a class="btn" href="${navURL(s)}" target="_blank" rel="noopener">ナビ</a>
@@ -224,20 +261,24 @@ function render(){
   const app=document.getElementById('app');
   const list=visible(),scope=ordSpots().filter(s=>!pref.area||s.area===pref.area);
   const total=scope.length,dn=scope.filter(s=>doneToday(s.id)).length;
-  const next=scope.find(s=>pending(s.id));
+  const pr=pref.area&&routes[pref.area],pt=pr?.plan&&pr.plan.at===today();
+  const pp=pt?pr.plan.ids.filter(id=>pending(id)):[];
+  const next=pt?(pp.length?scope.find(s=>s.id===pp[0]):null):scope.find(s=>pending(s.id));
   let html=`<h1>巡回管理</h1>
   <div class="card"><div class="stats"><div><b>${total}</b>${pref.area?'エリア地点':'登録地点'}</div><div><b>${dn}</b>本日巡回済み</div><div><b>${total-dn}</b>本日残り</div></div></div>
-  <select onchange="pref.area=this.value;savePref();render()"><option value="">すべてのエリア</option>${areas().map(a=>`<option ${a===pref.area?'selected':''}>${esc(a)}</option>`).join('')}</select>
+  <select onchange="pref.area=this.value;editList=null;savePref();render()"><option value="">すべてのエリア</option>${areas().map(a=>`<option ${a===pref.area?'selected':''}>${esc(a)}</option>`).join('')}</select>
   <div class="row"><label class="sub"><input type="checkbox" ${pref.onlyUnvisited?'checked':''} onchange="pref.onlyUnvisited=this.checked;savePref();render()"> 未巡回のみ表示（再開）</label>
   <select style="width:auto" onchange="pref.mode=this.value;savePref();render()">${Object.entries(TRAVEL_MODES).map(([k,v])=>`<option value="${k}" ${k===pref.mode?'selected':''}>${v}</option>`).join('')}</select></div>`;
-  if(pref.area){const r=routes[pref.area];
-    html+=`<div class="card"><b>最適ルート（${esc(pref.area)}）</b>
-    <div class="sub">${r?.order?`基点：${esc(r.station.name)} ／ 直線距離の合計 約${r.km.toFixed(1)}km${r.miss?.length?` ／ 位置不明：${esc(r.miss.join(', '))}`:''}`:'現在はCSVの順です。'}</div>
+  if(pref.area){const r=routes[pref.area],pl=r?.plan;
+    html+=`<div class="card"><b>巡回プラン（${esc(pref.area)}）</b>
+    <div class="sub">${pl?`${r.station?`基点：${esc(r.station.name)} ／ `:''}${pl.ids.length}軒${pl.km!=null?` ／ 往復の直線距離 約${pl.km.toFixed(1)}km`:''}${pl.manual?' ／ 手動':''}（${pl.at.replace(/-/g,'/')}作成）${r.miss?.length?` ／ 位置不明：${esc(r.miss.join(', '))}`:''}`:'未作成です。現在はCSVの順です。'}</div>
+    <div class="row" style="align-items:center"><span class="sub">回る軒数</span><select id="cnt" style="width:auto" onchange="pref.count=+this.value;savePref()">${[3,5,8,10,15,20,30,0].map(v=>`<option value="${v}" ${v===(pref.count??10)?'selected':''}>${v?v+'軒':'すべて'}</option>`).join('')}</select></div>
     <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
-    <div class="row"><button class="p" onclick="makeRoute()">駅から最適ルートを作る</button>${r?.order?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
-    <div class="sub" id="st"></div></div>`}
+    <div class="row"><button class="p" onclick="makePlan()">駅から往復ルートを作る</button><button onclick="startEdit()">ルートを手動で決める</button>${r?.station?`<a class="btn" href="${stationNav(r.station)}" target="_blank" rel="noopener">駅へ戻るナビ</a>`:''}${pl?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
+    <div class="sub" id="st"></div></div>${editList?editHTML():''}`}
   if(!spots.length)html+=`<div class="card">地点がありません。下の「データ管理」でCSVの中身を貼り付けて登録してください。</div>`;
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
+  else if(pt)html+=`<div class="card"><b>🎉 巡回プラン完了</b><div class="sub">最後は駅へ戻りましょう。続けて回る場合は、軒数を選んで再度ルートを作成できます。</div>${pr.station?`<div class="row"><a class="btn p" href="${stationNav(pr.station)}" target="_blank" rel="noopener">${esc(pr.station.name)}へ戻るナビ</a></div>`:''}</div>`;
   else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
   const groups={};list.forEach(s=>(groups[s.area]=groups[s.area]||[]).push(s));
   Object.entries(groups).forEach(([a,l])=>{html+=`<h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')});
