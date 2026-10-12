@@ -6,6 +6,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="巡回管理">
 <title>巡回管理</title>
+<!-- 地図表示: Leaflet(1.9.4) と 国土地理院/OpenStreetMap のタイル。地図を開いたときだけ表示範囲のタイル取得が外部に送られます -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <style>
 :root{--bg:#eef1ee;--card:#fff;--ink:#1b2a25;--sub:#5d6b66;--line:#d5dcd8;--main:#1f6f5c;--done:#e3f1ea;--warn:#b4531f}
 @media(prefers-color-scheme:dark){:root{--bg:#121816;--card:#1c2522;--ink:#e8efec;--sub:#9aa9a3;--line:#33403b;--main:#4fb89d;--done:#1d3329;--warn:#e08a55}}
@@ -23,7 +26,7 @@ button.p{background:var(--main);color:#fff;border-color:var(--main)}
 button.on{background:var(--main);color:#fff;border-color:var(--main)}
 button.ng.on{background:var(--warn);border-color:var(--warn)}
 select{width:100%}
-textarea,input[type=text],input[type=number]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+textarea,input[type=text],input[type=number],input[type=search]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
 .stats{display:flex;gap:8px}.stats div{flex:1;text-align:center}.stats b{display:block;font-size:24px}
 .sub{color:var(--sub);font-size:14px}
 .hide{display:none}
@@ -33,11 +36,22 @@ a.btn{text-decoration:none}
 .btn.p{background:var(--main);color:#fff;border-color:var(--main)}
 .badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--sub);vertical-align:2px}
 .badge.ok{background:var(--main);border-color:var(--main);color:#fff}
+#mapv{display:flex;flex-direction:column;overflow:hidden;z-index:2000;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+#mapv.hide{display:none}
+#map{flex:1;min-height:0}
+.pin{width:30px;height:30px;border-radius:50%;background:#d64545;color:#fff;font:bold 13px/26px sans-serif;text-align:center;border:2px solid #fff;box-shadow:0 1px 4px #0006}
+.pin.done{background:#2f6fd6}.pin.sel{outline:3px solid #ffd23f;font-size:15px}.pin.fx{border-style:dashed}.pin.stn{background:#444;font-size:12px}
 label.btn{display:inline-block}
 </style>
 </head>
 <body>
 <main id="app"></main>
+<div id="mapv" class="modal hide">
+ <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px"><b>地図で確認</b><select id="maplayer" style="width:auto;padding:6px" onchange="setLayer(this.value)"><option value="std">地理院 標準</option><option value="pale">地理院 淡色</option><option value="photo">航空写真</option><option value="osm">OpenStreetMap</option></select><button onclick="closeMap()">閉じる</button></div>
+ <div id="map"></div>
+ <div style="padding:8px 12px"><div id="mapinfo" class="sub"></div>
+  <div class="row"><button onclick="resetAllDone()">すべて未巡回に戻す</button><button id="fixbtn" onclick="toggleFix()">位置を直す</button><button id="mundo" onclick="mapUndo()">最後を取り消す</button><button id="mclr" onclick="mapSel=[];mapLast=null;drawMap()">クリア</button><button id="msave" class="p" onclick="saveMap()">この順で決定</button></div></div>
+</div>
 <script>
 /* ============================================================
  * 巡回管理アプリ（個人利用）
@@ -48,7 +62,7 @@ label.btn{display:inline-block}
  *    バックアップJSONには住所が含まれるため、保管先・送付先に注意してください。
  *  - 地点情報(SPOTS_KEY)と巡回記録(RECORDS_KEY)は別キーで管理し、CSV再読込でも記録を保持します。
  * ============================================================ */
-const SPOTS_KEY='patrol.spots.v1', RECORDS_KEY='patrol.records.v1', PREF_KEY='patrol.pref.v1', GEO_KEY='patrol.geo.v1', ROUTES_KEY='patrol.routes.v1';
+const SPOTS_KEY='patrol.spots.v1', RECORDS_KEY='patrol.records.v1', PREF_KEY='patrol.pref.v1', GEO_KEY='patrol.geo.v2', ROUTES_KEY='patrol.routes.v1', FIX_KEY='patrol.fixes.v1';
 const DIRS=['正面','右側','左側','裏面'], PHOTO=['未確認','撮影済み','撮影不可'], CLEAN=['未確認','清掃済み','清掃不要'];
 const TRAVEL_MODES={driving:'車',walking:'徒歩',transit:'公共交通',bicycling:'自転車'}; // 拡張しやすい移動モード定義
 const load=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
@@ -56,15 +70,23 @@ const save=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
 let spots=load(SPOTS_KEY,[]);           // [{id,name,address,area,num,order}]  固定情報のみ
 let records=load(RECORDS_KEY,{});       // {id:{history:[YYYY-MM-DD],clean,photos:[..4],memo}}
 let editList=null;                      // 手動ルート編集中の一時データ [{id,on}]
+let fixes=load(FIX_KEY,{});             // 手動修正 {id:{address?,orig?,lat?,lng?}} CSV再読込でも保持
+const gk=s=>(pref.pre?.[s.area]||'')+s.address; // 座標キャッシュのキー（地名補完込み）
+const pos=s=>fixes[s.id]?.lat!=null?fixes[s.id]:geo[gk(s)]; // 手動補正した位置を優先
+function applyFixes(){spots.forEach(s=>{const f=fixes[s.id];if(f?.address)s.address=f.address})}
 let geo=load(GEO_KEY,{});               // 住所→座標のキャッシュ（ルート作成用。外部APIで取得）
-let routes=load(ROUTES_KEY,{});         // {エリア:{station,order:[id],km,miss,at}} 最適化した巡回順
-let pref=Object.assign({area:'',mode:'bicycling',onlyUnvisited:false,detail:null},load(PREF_KEY,{}));
+let routes=load(ROUTES_KEY,{});
+applyFixes();         // {エリア:{station,order:[id],km,miss,at}} 最適化した巡回順
+let pref=Object.assign({area:'',pre:{},mode:'bicycling',onlyUnvisited:false,detail:null},load(PREF_KEY,{}));
 const savePref=()=>save(PREF_KEY,pref);
 if(!pref.v2){pref.mode='bicycling';pref.v2=1;savePref()} // 初期値を自転車に
 const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const rec=id=>records[id]||(records[id]={history:[],clean:0,photos:[0,0,0,0],memo:''});
-const doneToday=id=>(records[id]?.history||[]).includes(today());
+const rec=id=>records[id]||(records[id]={history:[],done:false,clean:0,photos:[0,0,0,0],memo:''});
+// 巡回済み状態（done）。日付に関係なく、「未巡回に戻す」まで保持される。履歴(history)は別に残る。
+const doneToday=id=>!!records[id]?.done;
+function migrateDone(){let ch=false;Object.values(records).forEach(r=>{if(r.done===undefined){r.done=(r.history||[]).includes(today());ch=true}});if(ch)save(RECORDS_KEY,records)}
+migrateDone();
 const everDone=id=>(records[id]?.history||[]).length>0;
 // 「未完了」＝今日未巡回（巡回周期の再開用）。履歴は消さず日付を追加するだけ。
 const pending=id=>!doneToday(id);
@@ -90,18 +112,20 @@ function importCSV(text,silent){
   if(!list.length){alert('読み込める行がありません。');return}
   const old=new Set(spots.map(s=>s.id)), keep=list.filter(s=>old.has(s.id)).length;
   if(!silent&&!confirm(`${list.length}地点を読み込みます（既存と一致:${keep}件）。\n巡回記録は消えません。続けますか？`))return;
-  spots=list;save(SPOTS_KEY,spots);render();
+  spots=list;applyFixes();save(SPOTS_KEY,spots);render();
 }
 
 /* ---- ナビ（住所のみ。緯度経度は不使用） ---- */
 function navURL(s){
   // Google Maps Directions URL。origin省略=現在地。iPhoneはGoogleマップアプリがあればアプリで、無ければSafariで開く。
-  return 'https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(s.address||s.name)+'&travelmode='+pref.mode;
+  return 'https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(fixes[s.id]?.lat!=null?fixes[s.id].lat+','+fixes[s.id].lng:((pref.pre?.[s.area]||'')+headAddr(s)||s.name))+'&travelmode='+pref.mode;
 }
 
 /* ---- 操作 ---- */
-function toggleDone(id){const h=rec(id).history;const t=today();
-  const i=h.indexOf(t);if(i>=0)h.splice(i,1);else{h.push(t);h.sort().reverse()}
+function toggleDone(id){
+  const r=rec(id),t=today();
+  if(r.done){r.done=false;const i=r.history.indexOf(t);if(i>=0)r.history.splice(i,1)} // 取り消し
+  else{r.done=true;if(!r.history.includes(t)){r.history.push(t);r.history.sort().reverse()}}
   save(RECORDS_KEY,records);render()}
 function setClean(id,v){rec(id).clean=v;save(RECORDS_KEY,records);render()}
 function setPhoto(id,i,v){rec(id).photos[i]=v;save(RECORDS_KEY,records);render()}
@@ -116,7 +140,7 @@ function importCSVText(){
 }
 
 /* ---- バックアップ（クリップボードの文字列） ---- */
-function backupText(){return JSON.stringify({version:2,exportedAt:new Date().toISOString(),spots,records,routes})}
+function backupText(){return JSON.stringify({version:2,exportedAt:new Date().toISOString(),spots,records,routes,fixes,pre:pref.pre})}
 async function copyBackup(){
   const t=backupText();
   try{await navigator.clipboard.writeText(t);alert('バックアップをクリップボードにコピーしました。メモアプリなどに貼り付けて保管してください。')}
@@ -126,7 +150,7 @@ function restoreBackup(){
   const t=document.getElementById('bk').value.trim();
   try{const d=JSON.parse(t);if(!Array.isArray(d.spots)||typeof d.records!=='object')throw 0;
     if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))return;
-    spots=d.spots;records=d.records;routes=d.routes||{};
+    spots=d.spots;records=d.records;migrateDone();routes=d.routes||{};fixes=d.fixes||{};save(FIX_KEY,fixes);pref.pre=d.pre||{};savePref();applyFixes();
     save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);render();alert('復元しました。');
   }catch(e){alert('バックアップの文字列が正しくありません。全体をコピーできているか確認してください。')}
 }
@@ -136,9 +160,23 @@ function restoreBackup(){
  *       最寄り駅をHeartRails Express APIへ送信します。座標は端末内にキャッシュされます。
  * 距離は直線距離での近似です（実際の自転車ルートではありません）。 */
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function geocode(addr){
-  try{const r=await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q='+encodeURIComponent(addr));
-    const c=(await r.json())[0]?.geometry?.coordinates;return c?{lat:c[1],lng:c[0]}:null}catch(e){return null}
+/* 住所の整形：全角数字→半角、漢数字の丁目→算用数字、「先」「及び…」や建物名など後ろの説明を除く */
+const toHalf=t=>t.replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-65248)).replace(/(\d)[ー－‐―−](?=\d)/g,'$1-');
+function kanjiNum(k){const d={一:1,二:2,三:3,四:4,五:5,六:6,七:7,八:8,九:9};let n=0,t=0;for(const c of k){if(c==='十'){n+=(t||1)*10;t=0}else t=d[c]||0}return n+t}
+function headAddr(s){return s.address.split(/[\s　]/)[0].replace(/(及び|および|、|，|／).*$/,'').replace(/先$/,'').replace(/番$/,'')||s.address}
+// 同じ町名が全国にあるため、エリアごとの地名（例：東京都千代田区）を頭に付け、結果にもその地名が含まれるものだけ採用する
+async function geocode(s){
+  const pre=pref.pre?.[s.area]||'';
+  const head=headAddr(s),hf=toHalf(head);
+  const ar=hf.replace(/([一二三四五六七八九十]+)丁目/,(m,k)=>kanjiNum(k)+'丁目');
+  const cands=[...new Set([ar,hf,head,ar.replace(/(丁目\d+).*$/,'$1'),ar.replace(/丁目.*$/,'丁目')].filter(x=>x).map(x=>pre+x))];
+  for(const q of cands){
+    try{const r=await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q='+encodeURIComponent(q));
+      const hit=(await r.json()).find(x=>!pre||(x.properties?.title||'').includes(pre));
+      if(hit){const c=hit.geometry.coordinates;return{lat:c[1],lng:c[0]}}}catch(e){}
+    await sleep(100);
+  }
+  return null;
 }
 async function stationByName(name){
   const q=/駅$/.test(name)?name:name+'駅';
@@ -172,9 +210,9 @@ async function makePlan(){
   try{
     const list=ordSpots().filter(s=>s.area===a),miss=[];
     for(let i=0;i<list.length;i++){const s=list[i];st(`住所を位置情報に変換中 ${i+1}/${list.length}`);
-      if(!geo[s.address]){const p=await geocode(s.address);if(p){geo[s.address]=p;save(GEO_KEY,geo);await sleep(150)}}
-      if(!geo[s.address])miss.push(s.id)}
-    const items=list.filter(s=>geo[s.address]).map(s=>({id:s.id,p:geo[s.address]}));
+      if(!pos(s)){const p=await geocode(s);if(p){geo[gk(s)]=p;save(GEO_KEY,geo);await sleep(150)}}
+      if(!pos(s))miss.push(s.id)}
+    const items=list.filter(s=>pos(s)).map(s=>({id:s.id,p:pos(s)}));
     if(!items.length)throw new Error('住所を位置情報に変換できませんでした。');
     const manual=(document.getElementById('stn').value||'').trim();
     st('基点の駅を探しています…');
@@ -221,15 +259,118 @@ function editHTML(){
    ${e.on?`<button onclick="moveEdit(${i},-9999)">⤒</button><button onclick="moveEdit(${i},-1)">▲</button><button onclick="moveEdit(${i},1)">▼</button>`:''}</div>`}).join('')}
   <div class="row"><button class="p" onclick="saveEdit()">このルートで決定</button><button onclick="editList=null;render()">キャンセル</button></div></div>`;
 }
+function commitPlan(a,on,allIds){
+  const r=routes[a]||{},sp=Object.fromEntries(spots.map(s=>[s.id,s]));
+  let km=null; // 基点駅があり座標が取得済みなら往復距離の目安を出す
+  if(r.station&&on.every(id=>pos(sp[id]||{}))){km=0;let cur=r.station;on.forEach(id=>{const p=pos(sp[id]);km+=dist(cur,p);cur=p});km+=dist(cur,r.station)}
+  routes[a]={...r,order:[...on,...allIds.filter(id=>!on.includes(id))],plan:{ids:on,km,at:today(),manual:true}};
+  save(ROUTES_KEY,routes);
+}
 function saveEdit(){
   const a=pref.area,on=editList.filter(e=>e.on).map(e=>e.id);
   if(!on.length){alert('回る地点を1つ以上選んでください。');return}
-  const r=routes[a]||{},sp=Object.fromEntries(spots.map(s=>[s.id,s]));
-  let km=null; // 基点駅があり座標が取得済みなら往復距離の目安を出す
-  if(r.station&&on.every(id=>geo[sp[id]?.address])){km=0;let cur=r.station;on.forEach(id=>{const p=geo[sp[id].address];km+=dist(cur,p);cur=p});km+=dist(cur,r.station)}
-  routes[a]={...r,order:[...on,...editList.map(e=>e.id).filter(id=>!on.includes(id))],plan:{ids:on,km,at:today(),manual:true}};
-  save(ROUTES_KEY,routes);editList=null;render();
+  commitPlan(a,on,editList.map(e=>e.id));editList=null;render();
 }
+
+/* ---- 地図でルートを選ぶ（Leaflet + OpenStreetMap。Googleマップは使わない） ----
+ * 印をタップした順が巡回順。もう一度タップすると外れる。 */
+let mapFix=false,mapView=false,tileLayer=null;
+const TILES={std:['https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png','地理院タイル',18],pale:['https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png','地理院タイル',18],photo:['https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg','地理院タイル',18],osm:['https://tile.openstreetmap.org/{z}/{x}/{y}.png','© OpenStreetMap',19]};
+function setLayer(k){pref.tile=k;savePref();if(!mapMap)return;if(tileLayer)mapMap.removeLayer(tileLayer);const t=TILES[k]||TILES.std;tileLayer=L.tileLayer(t[0],{maxNativeZoom:t[2],maxZoom:19,attribution:t[1]}).addTo(mapMap)}
+function toggleFix(){mapFix=!mapFix;document.getElementById('fixbtn').classList.toggle('on',mapFix);drawMap()}
+function mapResetPos(){const f=fixes[mapLast];if(!f)return;delete f.lat;delete f.lng;if(!f.address)delete fixes[mapLast];save(FIX_KEY,fixes);drawMap()}
+let mapSel=[],mapMap=null,mapGroup=null,mapSpots=[],mapAll=[],mapLast=null;
+async function ensureGeo(list,st){
+  const miss=[];
+  for(let i=0;i<list.length;i++){const s=list[i];st(`住所を位置情報に変換中 ${i+1}/${list.length}`);
+    if(!pos(s)){const p=await geocode(s);if(p){geo[gk(s)]=p;save(GEO_KEY,geo);await sleep(150)}}
+    if(!pos(s))miss.push(s.id)}
+  return miss;
+}
+async function openMap(){
+  const a=pref.area;if(window._busy)return;
+  if(typeof L==='undefined'){alert('地図ライブラリを読み込めませんでした。ネット接続を確認してください。');return}
+  window._busy=1;
+  const st=t=>{const e=document.getElementById('gst');if(e)e.textContent=t};
+  try{
+    const list=ordSpots().filter(s=>!a||s.area===a);
+    const miss=await ensureGeo(list,st);st('');
+    mapAll=list.map(s=>s.id);mapSpots=list.filter(s=>pos(s));
+    if(!mapSpots.length)throw new Error('住所を位置情報に変換できませんでした。');
+    const pl=routes[a]?.plan;mapSel=(pl)?pl.ids.filter(id=>mapSpots.some(s=>s.id===id)):[];
+    mapLast=null;
+    document.getElementById('mapv').classList.remove('hide');
+    if(!mapMap){mapMap=L.map('map');mapGroup=L.layerGroup().addTo(mapMap);setLayer(pref.tile||'std')}
+    document.getElementById('maplayer').value=pref.tile||'std';
+    await sleep(50);mapMap.invalidateSize();
+    const pts=mapSpots.map(s=>[pos(s).lat,pos(s).lng]);
+    const stn=routes[a]?.station;if(stn)pts.push([stn.lat,stn.lng]);
+    mapMap.fitBounds(L.latLngBounds(pts),{padding:[30,30]});
+    mapView=!a;['mundo','mclr','msave'].forEach(i=>document.getElementById(i).classList.toggle('hide',mapView));
+    drawMap(miss);
+  }catch(e){alert('地図を開けませんでした。\n'+e.message)}
+  window._busy=0;
+}
+function drawMap(miss){
+  if(miss)window._mapMiss=miss;
+  mapGroup.clearLayers();
+  const stn=routes[pref.area]?.station,by=Object.fromEntries(mapSpots.map(s=>[s.id,s]));
+  const ll=mapSel.filter(id=>by[id]).map(id=>[pos(by[id]).lat,pos(by[id]).lng]);
+  if(ll.length){const line=stn?[[stn.lat,stn.lng],...ll,[stn.lat,stn.lng]]:ll;L.polyline(line,{color:'#1f6f5c',weight:4,opacity:.8}).addTo(mapGroup)}
+  const icon=(cls,t)=>L.divIcon({className:'',html:`<div class="pin ${cls}">${t}</div>`,iconSize:[30,30],iconAnchor:[15,15]});
+  if(stn)L.marker([stn.lat,stn.lng],{icon:icon('stn','駅')}).addTo(mapGroup);
+  mapSpots.forEach(s=>{const i=mapSel.indexOf(s.id),p=pos(s),fx=fixes[s.id]?.lat!=null;
+    const cls=(mapDone(s)?'done':'')+(i>=0?' sel':'')+(fx?' fx':'');
+    L.marker([p.lat,p.lng],{icon:icon(cls,s.num??''),draggable:mapFix})
+      .on('click',()=>{if(mapFix){mapLast=s.id;drawMap()}else tapPin(s.id)})
+      .on('dragend',e=>{const q=e.target.getLatLng();fixes[s.id]={...fixes[s.id],lat:q.lat,lng:q.lng};save(FIX_KEY,fixes);mapLast=s.id;drawMap()})
+      .addTo(mapGroup)});
+  const m=window._mapMiss||[],l=mapLast&&by[mapLast];
+  const red=mapSpots.filter(x=>!mapDone(x)).length,blue=mapSpots.length-red;
+  document.getElementById('mapinfo').innerHTML=`<span style="color:#d64545">●</span>未巡回 ${red}　<span style="color:#2f6fd6">●</span>巡回済み ${blue}　／　黄色い枠＝ルート選択中（${mapSel.length}軒）、数字は識別番号`
+    +(mapFix?'<div><b>位置修正モード：</b>印をドラッグして正しい場所へ動かすと自動保存されます（点線の枠は修正済み）。</div>':'')
+    +(l?`<div style="color:var(--ink)"><b>${esc(l.id)}</b> ${esc(l.name)}<br>${esc(l.address)}${fixes[l.id]?.lat!=null?' <button onclick="mapResetPos()">位置を元に戻す</button>':''}</div>`:(mapFix?'':(mapView?'<div>印をタップすると地点の情報が表示されます。エリアを選んで開くと、ルートも選べます。</div>':'<div>印をタップした順が巡回順になります。もう一度タップすると外れます。</div>')))
+    +(m.length?`<div>位置不明（地図に出ません）：${esc(m.join(', '))}。詳細画面で住所を修正してください。</div>`:'');
+}
+function mapDone(s){return doneToday(s.id)} // 巡回済みは無条件で青
+function tapPin(id){if(mapView){mapLast=id;drawMap();return}const i=mapSel.indexOf(id);if(i>=0)mapSel.splice(i,1);else mapSel.push(id);mapLast=id;drawMap()}
+function mapUndo(){mapSel.pop();mapLast=null;drawMap()}
+function closeMap(){mapFix=false;document.getElementById('fixbtn').classList.remove('on');document.getElementById('mapv').classList.add('hide')}
+function saveMap(){
+  if(!mapSel.length){alert('地図の印をタップして、回る地点を選んでください。');return}
+  commitPlan(pref.area,mapSel.slice(),mapAll);closeMap();render();
+}
+/* ---- 住所・位置の修正（CSVとは別に保存し、CSV再登録後も保持する） ---- */
+function saveAddr(id){
+  const v=document.getElementById('adr').value.trim(),s=spots.find(x=>x.id===id);
+  if(!v||!s||v===s.address)return;
+  fixes[id]={orig:fixes[id]?.orig??s.address,address:v}; // 住所を変えたら手動の位置調整は破棄（新住所で再取得）
+  save(FIX_KEY,fixes);applyFixes();save(SPOTS_KEY,spots);render();
+  alert('保存しました。地図・ルート作成のときに新しい住所を座標に変換します。');
+}
+function resetFix(id){
+  const f=fixes[id],s=spots.find(x=>x.id===id);if(f?.orig&&s)s.address=f.orig;
+  delete fixes[id];save(FIX_KEY,fixes);save(SPOTS_KEY,spots);render();
+}
+/* ---- 一覧の検索（入力のたびに表示/非表示を切り替える。全角半角・ハイフン・空白の違いは無視、複数語はAND） ---- */
+let searchQ='';
+const nz=t=>toHalf(String(t||'')).toLowerCase().replace(/[\s　\-ー－‐―−]/g,'');
+function applySearch(){
+  const ks=searchQ.split(/[\s　]+/).map(nz).filter(Boolean);let shown=0;
+  document.querySelectorAll('#app .grp').forEach(g=>{let any=false;
+    g.querySelectorAll('.card[data-s]').forEach(c=>{const ok=ks.every(k=>c.dataset.s.includes(k));c.style.display=ok?'':'none';if(ok){any=true;shown++}});
+    g.style.display=any?'':'none'});
+  const e=document.getElementById('qc');if(e)e.textContent=ks.length?(shown?`${shown}件が見つかりました`:'見つかりませんでした'):'';
+}
+// すべて（エリア選択中はそのエリア）の巡回済みを未巡回に戻す。巡回履歴は消さない
+function resetAllDone(){
+  const sc=spots.filter(x=>!pref.area||x.area===pref.area),n=sc.filter(x=>doneToday(x.id)).length;
+  if(!n){alert('巡回済みの地点はありません。');return}
+  if(!confirm(`${pref.area?pref.area+'エリア':'すべて'}の巡回済み ${n}件を未巡回に戻します。巡回履歴は残ります。よろしいですか？`))return;
+  sc.forEach(x=>{if(records[x.id])records[x.id].done=false});
+  save(RECORDS_KEY,records);render();if(mapGroup&&mapSpots.length)drawMap();
+}
+function setPre(v){pref.pre=pref.pre||{};pref.pre[pref.area]=v.trim();savePref();render()}
 function resetRoute(){delete routes[pref.area];save(ROUTES_KEY,routes);render()}
 // 表示順：エリアはCSV登場順、エリア内は最適化済みならその順、未作成ならCSV順
 function orderIdx(s){const o=routes[s.area]?.order;const i=o?o.indexOf(s.id):-1;return i<0?1e6+s.order:i}
@@ -242,7 +383,7 @@ function visible(){let l=ordSpots().filter(s=>!pref.area||s.area===pref.area);
 const badge=d=>`<span class="badge ${d?'ok':''}">${d?'巡回済み':'未巡回'}</span>`;
 function spotCard(s,isNext){
   const d=doneToday(s.id);
-  return `<div class="card ${d?'done':''} ${isNext?'next':''}">
+  return `<div class="card ${d?'done':''} ${isNext?'next':''}" ${isNext?'':`data-s="${esc([s.id,s.name,s.address,records[s.id]?.memo].map(nz).join('|'))}"`}>
   <b>${d?'✓ ':''}${esc(s.id)} ${esc(s.name)}</b> ${badge(d)} ${planNo(s)}
   <div class="sub">${esc(s.address)}</div>
   <div class="row">
@@ -259,6 +400,9 @@ function detailHTML(s){
   <h1>${esc(s.id)}</h1><div><b>${esc(s.name)}</b> ${badge(d)}</div><div class="sub">${esc(s.address)}</div>
   <div class="row"><a class="btn p" href="${navURL(s)}" target="_blank" rel="noopener" style="background:var(--main);color:#fff;text-decoration:none">Googleマップでナビ</a>
   <button class="${d?'on':'p'}" onclick="toggleDone('${esc(s.id)}')">${d?'取り消す':'巡回済みにする'}</button></div>
+  <h2>住所の修正</h2><input type="text" id="adr" value="${esc(s.address)}">
+  <div class="row"><button class="p" onclick="saveAddr('${esc(s.id)}')">住所を保存</button>${fixes[s.id]?`<button onclick="resetFix('${esc(s.id)}')">元の住所・位置に戻す</button>`:''}</div>
+  <div class="sub">${fixes[s.id]?.lat!=null?'地図上の位置を手動で調整済みです（ナビは調整した位置へ案内します）。':'保存すると、ナビ・地図はこの住所を使います。'}地図上の位置は「地図で選ぶ」の「位置を直す」で動かせます。</div>
   <h2>清掃</h2><div class="seg">${CLEAN.map((n,i)=>`<button class="${r.clean===i?'on':''}" onclick="setClean('${esc(s.id)}',${i})">${n}</button>`).join('')}</div>
   <h2>写真（撮影状況のみ記録）</h2>
   <button onclick="allPhotos('${esc(s.id)}')">4方向すべて撮影済み</button>
@@ -276,24 +420,28 @@ function render(){
   const pp=pt?pr.plan.ids.filter(id=>pending(id)):[];
   const next=pt?(pp.length?scope.find(s=>s.id===pp[0]):null):scope.find(s=>pending(s.id));
   let html=`<h1>巡回管理</h1>
-  <div class="card"><div class="stats"><div><b>${total}</b>${pref.area?'エリア地点':'登録地点'}</div><div><b>${dn}</b>本日巡回済み</div><div><b>${total-dn}</b>本日残り</div></div></div>
+  <div class="card"><div class="stats"><div><b>${total}</b>${pref.area?'エリア地点':'登録地点'}</div><div><b>${dn}</b>巡回済み</div><div><b>${total-dn}</b>未巡回</div></div></div>
+  <div class="row" style="margin:0 0 8px"><button class="p" style="flex:1" onclick="openMap()">🗺 地図で確認</button><button style="flex:1" onclick="resetAllDone()">すべて未巡回に戻す</button></div><div class="sub" id="gst"></div>
   <select onchange="pref.area=this.value;editList=null;savePref();render()"><option value="">すべてのエリア</option>${areas().map(a=>`<option ${a===pref.area?'selected':''}>${esc(a)}</option>`).join('')}</select>
+  <input type="search" enterkeyhint="search" placeholder="🔍 識別番号・名称・住所・メモで検索" value="${esc(searchQ)}" oninput="searchQ=this.value;applySearch()" style="margin-top:8px"><div class="sub" id="qc"></div>
   <div class="row"><label class="sub"><input type="checkbox" ${pref.onlyUnvisited?'checked':''} onchange="pref.onlyUnvisited=this.checked;savePref();render()"> 未巡回のみ表示（再開）</label>
   <select style="width:auto" onchange="pref.mode=this.value;savePref();render()">${Object.entries(TRAVEL_MODES).map(([k,v])=>`<option value="${k}" ${k===pref.mode?'selected':''}>${v}</option>`).join('')}</select></div>`;
   if(pref.area){const r=routes[pref.area],pl=r?.plan;
     html+=`<div class="card"><b>巡回プラン（${esc(pref.area)}）</b>
+    <div class="sub" style="margin-top:6px">住所の頭に付ける地名（都道府県・市区町村）</div><input type="text" value="${esc(pref.pre?.[pref.area]||'')}" placeholder="例：東京都千代田区" onchange="setPre(this.value)">
+    ${(!/^(北海道|東京都|京都府|大阪府|.{2,3}県)/.test(scope[0]?.address||'')&&!pref.pre?.[pref.area])?'<div class="sub" style="color:var(--warn)">⚠ 住所に都道府県・市区町村がないため、上の欄に入れないと同じ町名の別の地域（北海道など）に印が付くことがあります。</div>':''}
     <div class="sub">${pl?`${r.station?`基点：${esc(r.station.name)} ／ `:''}${pl.ids.length}軒${pl.km!=null?` ／ 往復の直線距離 約${pl.km.toFixed(1)}km`:''}${pl.manual?' ／ 手動':''}（${pl.at.replace(/-/g,'/')}作成）${r.miss?.length?` ／ 位置不明：${esc(r.miss.join(', '))}`:''}`:'未作成です。現在はCSVの順です。'}</div>
     <div class="row" style="align-items:center"><span class="sub">回る軒数</span><select id="cnt" style="width:auto" onchange="pref.count=+this.value;savePref()">${[3,5,8,10,15,20,30,0].map(v=>`<option value="${v}" ${v===(pref.count??10)?'selected':''}>${v?v+'軒':'すべて'}</option>`).join('')}</select></div>
     <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
     <div class="row"><button class="p" onclick="makePlan()">駅から往復ルートを作る</button><button onclick="startEdit()">ルートを手動で決める</button>${r?.station?`<a class="btn" href="${stationNav(r.station)}" target="_blank" rel="noopener">駅へ戻るナビ</a>`:''}${pl?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
     <div class="sub" id="st"></div></div>${editList?editHTML():''}`}
-  else if(spots.length)html+=`<div class="card sub">エリアを選ぶと「巡回プラン」（往復ルート作成・ルートを手動で決める）が使えます。</div>`;
+  else if(spots.length)html+=`<div class="card sub">エリアを選ぶと「巡回プラン」（往復ルート作成・手動ルート）が使えます。「地図で確認」はエリアを選ぶと、印をタップしてルートも選べます。</div>`;
   if(!spots.length)html+=`<div class="card">地点がありません。下の「データ管理」でCSVの中身を貼り付けて登録してください。</div>`;
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
   else if(pt)html+=`<div class="card"><b>🎉 巡回プラン完了</b><div class="sub">最後は駅へ戻りましょう。続けて回る場合は、軒数を選んで再度ルートを作成できます。</div>${pr.station?`<div class="row"><a class="btn p" href="${stationNav(pr.station)}" target="_blank" rel="noopener">${esc(pr.station.name)}へ戻るナビ</a></div>`:''}</div>`;
   else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
   const groups={};list.forEach(s=>(groups[s.area]=groups[s.area]||[]).push(s));
-  Object.entries(groups).forEach(([a,l])=>{html+=`<h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')});
+  Object.entries(groups).forEach(([a,l])=>{html+=`<div class="grp"><h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')+'</div>'});
   html+=`<h2>データ管理</h2><div class="card">
    <textarea id="csvin" rows="3" placeholder="CSVの中身（識別番号,名称,住所）を貼り付け"></textarea>
    <div class="row"><button class="p" onclick="importCSVText()">貼り付けたCSVで地点を登録</button></div>
@@ -302,7 +450,7 @@ function render(){
    <textarea id="bk" rows="3" style="margin-top:8px" placeholder="復元するときは、バックアップの文字列をここに貼り付けてください"></textarea>
    <div class="sub" style="margin-top:8px">データはこの端末内のみに保存されます。機種変更前に必ずバックアップをコピーしてメモ等に保管してください。</div></div>`;
   const ds=pref.detail&&spots.find(s=>s.id===pref.detail);
-  app.innerHTML=html+(ds?detailHTML(ds):'');
+  app.innerHTML=html+(ds?detailHTML(ds):'');applySearch();
 }
 render();
 </script>
