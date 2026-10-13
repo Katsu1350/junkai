@@ -85,7 +85,9 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const rec=id=>records[id]||(records[id]={history:[],done:false,clean:0,photos:[0,0,0,0],memo:''});
 // 巡回済み状態（done）。日付に関係なく、「未巡回に戻す」まで保持される。履歴(history)は別に残る。
 const doneToday=id=>!!records[id]?.done;
-function migrateDone(){let ch=false;Object.values(records).forEach(r=>{if(r.done===undefined){r.done=(r.history||[]).includes(today());ch=true}});if(ch)save(RECORDS_KEY,records)}
+// 旧形式（doneが無い）の記録を変換。旧形式の巡回済みは「その日に巡回した」扱いだったので、基準日（通常は今日、復元時はバックアップを書き出した日）の履歴があれば巡回済みとする
+function localDate(iso){const d=new Date(iso);if(isNaN(d))return today();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+function migrateDone(ref){let ch=false;Object.values(records).forEach(r=>{if(r.done===undefined){r.done=(r.history||[]).includes(ref||today());ch=true}});if(ch)save(RECORDS_KEY,records)}
 migrateDone();
 const everDone=id=>(records[id]?.history||[]).length>0;
 // 「未完了」＝今日未巡回（巡回周期の再開用）。履歴は消さず日付を追加するだけ。
@@ -133,6 +135,17 @@ function allPhotos(id){rec(id).photos=[1,1,1,1];save(RECORDS_KEY,records);render
 function setMemo(id,v){rec(id).memo=v;save(RECORDS_KEY,records)}
 
 /* ---- CSV登録（CSVの中身を貼り付け。ファイルはGitHubに置かない） ---- */
+/* ---- CSV書き出し（登録時と同じ「識別番号,名称,住所」形式。住所は修正後のもの） ---- */
+function csvText(){
+  const q=v=>/[",\r\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;
+  return ['識別番号,名称,住所',...spots.slice().sort((a,b)=>a.order-b.order).map(x=>[x.id,x.name,x.address].map(q).join(','))].join('\n');
+}
+async function copyCSV(){
+  if(!spots.length){alert('地点がありません。');return}
+  const t=csvText();
+  try{await navigator.clipboard.writeText(t);alert('地点リストをCSV形式でコピーしました（'+spots.length+'件）。')}
+  catch(e){const b=document.getElementById('csvin');b.value=t;b.focus();b.select();b.setSelectionRange(0,t.length);alert('自動コピーできませんでした。入力欄の文字列を全選択してコピーしてください。')}
+}
 function importCSVText(){
   const t=document.getElementById('csvin').value;
   if(!t.trim()){alert('CSVの文字列を貼り付けてください。');return}
@@ -150,8 +163,8 @@ function restoreBackup(){
   const t=document.getElementById('bk').value.trim();
   try{const d=JSON.parse(t);if(!Array.isArray(d.spots)||typeof d.records!=='object')throw 0;
     if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))return;
-    spots=d.spots;records=d.records;migrateDone();routes=d.routes||{};fixes=d.fixes||{};save(FIX_KEY,fixes);pref.pre=d.pre||{};savePref();applyFixes();
-    save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);render();alert('復元しました。');
+    spots=d.spots;records=d.records;migrateDone(localDate(d.exportedAt));routes=d.routes||{};fixes=d.fixes||{};save(FIX_KEY,fixes);pref.pre=d.pre||{};savePref();applyFixes();
+    save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);render();alert(`復元しました。地点 ${spots.length}件、巡回済み ${spots.filter(x=>doneToday(x.id)).length}件`);
   }catch(e){alert('バックアップの文字列が正しくありません。全体をコピーできているか確認してください。')}
 }
 
@@ -278,7 +291,7 @@ let mapFix=false,mapView=false,tileLayer=null;
 const TILES={std:['https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png','地理院タイル',18],pale:['https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png','地理院タイル',18],photo:['https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg','地理院タイル',18],osm:['https://tile.openstreetmap.org/{z}/{x}/{y}.png','© OpenStreetMap',19]};
 function setLayer(k){pref.tile=k;savePref();if(!mapMap)return;if(tileLayer)mapMap.removeLayer(tileLayer);const t=TILES[k]||TILES.std;tileLayer=L.tileLayer(t[0],{maxNativeZoom:t[2],maxZoom:19,attribution:t[1]}).addTo(mapMap)}
 function toggleFix(){mapFix=!mapFix;document.getElementById('fixbtn').classList.toggle('on',mapFix);drawMap()}
-function mapResetPos(){const f=fixes[mapLast];if(!f)return;delete f.lat;delete f.lng;if(!f.address)delete fixes[mapLast];save(FIX_KEY,fixes);drawMap()}
+function mapResetPos(){const f=fixes[mapLast];if(!f)return;delete f.lat;delete f.lng;delete f.found;delete f.foundDone;if(!f.address)delete fixes[mapLast];save(FIX_KEY,fixes);drawMap()}
 let mapSel=[],mapMap=null,mapGroup=null,mapSpots=[],mapAll=[],mapLast=null;
 async function ensureGeo(list,st){
   const miss=[];
@@ -300,7 +313,7 @@ async function openMap(){
     const pl=routes[a]?.plan;mapSel=(pl)?pl.ids.filter(id=>mapSpots.some(s=>s.id===id)):[];
     mapLast=null;
     document.getElementById('mapv').classList.remove('hide');
-    if(!mapMap){mapMap=L.map('map');mapGroup=L.layerGroup().addTo(mapMap);setLayer(pref.tile||'std')}
+    if(!mapMap){mapMap=L.map('map');mapGroup=L.layerGroup().addTo(mapMap);mapMap.on('zoomend',()=>{if(mapSpots.length)drawMap()});setLayer(pref.tile||'std')}
     document.getElementById('maplayer').value=pref.tile||'std';
     await sleep(50);mapMap.invalidateSize();
     const pts=mapSpots.map(s=>[pos(s).lat,pos(s).lng]);
@@ -311,6 +324,40 @@ async function openMap(){
   }catch(e){alert('地図を開けませんでした。\n'+e.message)}
   window._busy=0;
 }
+/* ---- 重なった印を扇状に広げる（画面上の距離で判定。本来の位置とは点線で結ぶ） ---- */
+function spread(n){
+  const out=[];let ring=1,left=n;
+  while(left>0){const m=Math.min(ring*6,left),R=38*ring;
+    for(let i=0;i<m;i++){const g=-Math.PI/2+2*Math.PI*i/m+(ring%2?0:Math.PI/m);out.push([R*Math.cos(g),R*Math.sin(g)])}
+    left-=m;ring++}
+  return out;
+}
+/* ---- 位置から住所を取得（国土地理院の逆ジオコーダ。町丁目まで。取れなければNominatim） ---- */
+function loadMuni(){return new Promise(res=>{if(window.GSI?.MUNI_ARRAY)return res();const sc=document.createElement('script');sc.src='https://maps.gsi.go.jp/js/muni.js';sc.onload=res;sc.onerror=res;document.head.appendChild(sc)})}
+async function reverseAddr(lat,lng){
+  try{
+    const j=(await (await fetch(`https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat=${lat}&lon=${lng}`)).json()).results;
+    if(j?.muniCd){await loadMuni();const m=window.GSI?.MUNI_ARRAY?.[j.muniCd]||window.GSI?.MUNI_ARRAY?.[String(+j.muniCd)];
+      const a=m?m.split(','):[];return (a[1]||'')+(a[3]||'')+(j.lv01Nm||'')}
+  }catch(e){}
+  try{
+    const a=(await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&accept-language=ja&zoom=18&lat=${lat}&lon=${lng}`)).json()).address||{};
+    return [a.state,a.city||a.county,a.city_district||a.suburb,a.quarter||a.neighbourhood,a.road,a.house_number].filter(Boolean).join('');
+  }catch(e){}
+  return '';
+}
+const rev=new Set();
+async function reverseFor(id){
+  const f=fixes[id];if(!f||f.lat==null||rev.has(id))return;rev.add(id);
+  const lat=f.lat,lng=f.lng,a=await reverseAddr(lat,lng);rev.delete(id);
+  const g=fixes[id];if(!g||g.lat!==lat||g.lng!==lng)return; // 取得中に動かされたら破棄
+  g.found=a;g.foundDone=true;save(FIX_KEY,fixes);if(mapLast===id&&mapSpots.length)drawMap();
+}
+function adoptFound(){
+  const id=mapLast,f=fixes[id],sp=spots.find(x=>x.id===id);if(!f?.found||!sp)return;
+  fixes[id]={...f,orig:f.orig??sp.address,address:f.found};delete fixes[id].found;delete fixes[id].foundDone;
+  save(FIX_KEY,fixes);applyFixes();save(SPOTS_KEY,spots);drawMap();
+}
 function drawMap(miss){
   if(miss)window._mapMiss=miss;
   mapGroup.clearLayers();
@@ -318,20 +365,34 @@ function drawMap(miss){
   const ll=mapSel.filter(id=>by[id]).map(id=>[pos(by[id]).lat,pos(by[id]).lng]);
   if(ll.length){const line=stn?[[stn.lat,stn.lng],...ll,[stn.lat,stn.lng]]:ll;L.polyline(line,{color:'#1f6f5c',weight:4,opacity:.8}).addTo(mapGroup)}
   const icon=(cls,t)=>L.divIcon({className:'',html:`<div class="pin ${cls}">${t}</div>`,iconSize:[30,30],iconAnchor:[15,15]});
+  // 画面上で近い印をまとめ、まとまりごとに円状に広げる
+  const pts=mapSpots.map(s=>{const p=pos(s);return{s,p,lp:mapMap.latLngToLayerPoint([p.lat,p.lng])}});
+  const used=new Set(),placed=[];
+  pts.forEach((o,i)=>{
+    if(used.has(i))return;used.add(i);const mem=[i];
+    pts.forEach((q,j)=>{if(!used.has(j)&&o.lp.distanceTo(q.lp)<36){mem.push(j);used.add(j)}});
+    if(mem.length===1){placed.push({...o,disp:null});return}
+    const cx=mem.reduce((t,k)=>t+pts[k].lp.x,0)/mem.length,cy=mem.reduce((t,k)=>t+pts[k].lp.y,0)/mem.length,offs=spread(mem.length);
+    mem.forEach((k,n)=>placed.push({...pts[k],disp:mapMap.layerPointToLatLng(L.point(cx+offs[n][0],cy+offs[n][1]))}));
+  });
+  placed.filter(o=>o.disp).forEach(o=>{
+    L.polyline([[o.p.lat,o.p.lng],o.disp],{color:'#555',weight:1.5,dashArray:'4 3',opacity:.8,interactive:false}).addTo(mapGroup);
+    L.circleMarker([o.p.lat,o.p.lng],{radius:3,color:'#222',weight:1,fillColor:'#fff',fillOpacity:1,interactive:false}).addTo(mapGroup)});
   if(stn)L.marker([stn.lat,stn.lng],{icon:icon('stn','駅')}).addTo(mapGroup);
-  mapSpots.forEach(s=>{const i=mapSel.indexOf(s.id),p=pos(s),fx=fixes[s.id]?.lat!=null;
+  placed.forEach(({s,p,disp})=>{const i=mapSel.indexOf(s.id),fx=fixes[s.id]?.lat!=null;
     const cls=(mapDone(s)?'done':'')+(i>=0?' sel':'')+(fx?' fx':'');
-    L.marker([p.lat,p.lng],{icon:icon(cls,s.num??''),draggable:mapFix})
-      .on('click',()=>{if(mapFix){mapLast=s.id;drawMap()}else tapPin(s.id)})
-      .on('dragend',e=>{const q=e.target.getLatLng();fixes[s.id]={...fixes[s.id],lat:q.lat,lng:q.lng};save(FIX_KEY,fixes);mapLast=s.id;drawMap()})
+    L.marker(disp||[p.lat,p.lng],{icon:icon(cls,s.num??''),draggable:mapFix})
+      .on('click',()=>{if(fixes[s.id]?.lat!=null&&!fixes[s.id].foundDone)reverseFor(s.id);if(mapFix){mapLast=s.id;drawMap()}else tapPin(s.id)})
+      .on('dragend',e=>{const q=e.target.getLatLng();fixes[s.id]={...fixes[s.id],lat:q.lat,lng:q.lng,found:'',foundDone:false};save(FIX_KEY,fixes);mapLast=s.id;drawMap();reverseFor(s.id)})
       .addTo(mapGroup)});
-  const m=window._mapMiss||[],l=mapLast&&by[mapLast];
+  const m=window._mapMiss||[],l=mapLast&&by[mapLast],lf=l&&fixes[l.id];
   const red=mapSpots.filter(x=>!mapDone(x)).length,blue=mapSpots.length-red;
-  document.getElementById('mapinfo').innerHTML=`<span style="color:#d64545">●</span>未巡回 ${red}　<span style="color:#2f6fd6">●</span>巡回済み ${blue}　／　黄色い枠＝ルート選択中（${mapSel.length}軒）、数字は識別番号`
+  document.getElementById('mapinfo').innerHTML=`<span style="color:#d64545">●</span>未巡回 ${red}　<span style="color:#2f6fd6">●</span>巡回済み ${blue}　／　黄色い枠＝ルート選択中（${mapSel.length}軒）、数字は識別番号<br>重なる印は広げて表示し、点線の先の白丸が本来の位置です。`
     +(mapFix?'<div><b>位置修正モード：</b>印をドラッグして正しい場所へ動かすと自動保存されます（点線の枠は修正済み）。</div>':'')
-    +(l?`<div style="color:var(--ink)"><b>${esc(l.id)}</b> ${esc(l.name)}<br>${esc(l.address)}${fixes[l.id]?.lat!=null?' <button onclick="mapResetPos()">位置を元に戻す</button>':''}</div>`:(mapFix?'':(mapView?'<div>印をタップすると地点の情報が表示されます。エリアを選んで開くと、ルートも選べます。</div>':'<div>印をタップした順が巡回順になります。もう一度タップすると外れます。</div>')))
+    +(l?`<div style="color:var(--ink)"><b>${esc(l.id)}</b> ${esc(l.name)}<br>${esc(l.address)}${lf?.lat!=null?' <button onclick="mapResetPos()">位置を元に戻す</button><br>この位置の住所：'+(lf.foundDone?(lf.found?esc(lf.found)+' <button onclick="adoptFound()">この住所に更新</button>':'取得できませんでした'):'取得中…'):''}</div>`:(mapFix?'':(mapView?'<div>印をタップすると地点の情報が表示されます。エリアを選んで開くと、ルートも選べます。</div>':'<div>印をタップした順が巡回順になります。もう一度タップすると外れます。</div>')))
     +(m.length?`<div>位置不明（地図に出ません）：${esc(m.join(', '))}。詳細画面で住所を修正してください。</div>`:'');
 }
+
 function mapDone(s){return doneToday(s.id)} // 巡回済みは無条件で青
 function tapPin(id){if(mapView){mapLast=id;drawMap();return}const i=mapSel.indexOf(id);if(i>=0)mapSel.splice(i,1);else mapSel.push(id);mapLast=id;drawMap()}
 function mapUndo(){mapSel.pop();mapLast=null;drawMap()}
@@ -444,7 +505,7 @@ function render(){
   Object.entries(groups).forEach(([a,l])=>{html+=`<div class="grp"><h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')+'</div>'});
   html+=`<h2>データ管理</h2><div class="card">
    <textarea id="csvin" rows="3" placeholder="CSVの中身（識別番号,名称,住所）を貼り付け"></textarea>
-   <div class="row"><button class="p" onclick="importCSVText()">貼り付けたCSVで地点を登録</button></div>
+   <div class="row"><button class="p" onclick="importCSVText()">貼り付けたCSVで地点を登録</button><button onclick="copyCSV()">地点リストをCSVでコピー</button></div>
    <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
    <div class="row"><button onclick="copyBackup()">バックアップをコピー</button><button onclick="restoreBackup()">貼り付けた文字列から復元</button></div>
    <textarea id="bk" rows="3" style="margin-top:8px" placeholder="復元するときは、バックアップの文字列をここに貼り付けてください"></textarea>
