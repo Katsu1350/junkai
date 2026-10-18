@@ -447,6 +447,19 @@ function resetAllDone(){
   sc.forEach(x=>{if(records[x.id])records[x.id].done=false});
   save(RECORDS_KEY,records);render();if(mapGroup&&mapSpots.length)drawMap();
 }
+/* ---- 巡回日の表示と並べ替え ---- */
+const SORTS={new:'巡回日が新しい順',old:'巡回日が古い順（未巡回が先頭）'};
+const lastDate=id=>(records[id]?.history||[]).reduce((m,d)=>d>m?d:m,'');
+const fmtDate=d=>d.replace(/-/g,'/');
+function dateNote(id,done){const d=lastDate(id);if(!d)return '';
+  return `<div class="sub" style="${done?'color:var(--main);font-weight:600':''}">${done?'✓ '+fmtDate(d)+' に巡回':'前回の巡回：'+fmtDate(d)}</div>`}
+function sortList(l){
+  const k=pref.sort;if(!k)return l;
+  return l.slice().sort((a,b)=>{const x=lastDate(a.id),y=lastDate(b.id);
+    if(x===y)return 0;
+    if(k==='new'){if(!x)return 1;if(!y)return -1;return x<y?1:-1}  // 新しい順（未巡回は最後）
+    if(!x)return -1;if(!y)return 1;return x<y?-1:1});              // 古い順（未巡回が先頭）
+}
 function setPre(v){pref.pre=pref.pre||{};pref.pre[pref.area]=v.trim();savePref();render()}
 function resetRoute(){delete routes[pref.area];save(ROUTES_KEY,routes);render()}
 // 表示順：エリアはCSV登場順、エリア内は最適化済みならその順、未作成ならCSV順
@@ -464,7 +477,7 @@ function spotCard(s,isNext){
   const d=doneToday(s.id);
   return `<div class="card ${d?'done':''} ${isNext?'next':''}" ${isNext?'':`data-s="${esc([s.id,s.name,s.address,records[s.id]?.memo].map(nz).join('|'))}"`}>
   <b>${d?'✓ ':''}${esc(s.id)} ${esc(s.name)}</b> ${badge(d)} ${planNo(s)}
-  <div class="sub">${esc(s.address)}</div>
+  <div class="sub">${esc(s.address)}</div>${dateNote(s.id,d)}
   <div class="row">
    <a class="btn" href="${navURL(s)}" target="_blank" rel="noopener">ナビ</a>
    <button class="${d?'on':'p'}" onclick="toggleDone('${esc(s.id)}')">${d?'取り消す':'巡回済みにする'}</button>
@@ -493,7 +506,7 @@ function detailHTML(s){
 }
 function render(){
   const app=document.getElementById('app');
-  const list=visible(),scope=ordSpots().filter(s=>!pref.area||s.area===pref.area);
+  const list=sortList(visible()),scope=ordSpots().filter(s=>!pref.area||s.area===pref.area);
   const total=scope.length,dn=scope.filter(s=>doneToday(s.id)).length;
   const pr=routes[pref.area||''],pt=pr?.plan&&pr.plan.at===today();
   const pp=pt?pr.plan.ids.filter(id=>pending(id)):[];
@@ -503,6 +516,7 @@ function render(){
   <div class="row" style="margin:0 0 8px"><button class="p" style="flex:1" onclick="openMap()">🗺 地図で確認</button><button style="flex:1" onclick="resetAllDone()">すべて未巡回に戻す</button></div><div class="sub" id="gst"></div>
   <select onchange="pref.area=this.value;editList=null;savePref();render()"><option value="">すべてのエリア</option>${areas().map(a=>`<option ${a===pref.area?'selected':''}>${esc(a)}</option>`).join('')}</select>
   <input type="search" enterkeyhint="search" placeholder="🔍 識別番号・名称・住所・メモで検索" value="${esc(searchQ)}" oninput="searchQ=this.value;applySearch()" style="margin-top:8px"><div class="sub" id="qc"></div>
+  <div class="row" style="align-items:center"><span class="sub">並び順</span><select style="width:auto" onchange="pref.sort=this.value;savePref();render()">${[['','ルート/CSV順（標準）'],['new',SORTS.new],['old',SORTS.old]].map(([v,n])=>`<option value="${v}" ${v===(pref.sort||'')?'selected':''}>${n}</option>`).join('')}</select></div>
   <div class="row"><label class="sub"><input type="checkbox" ${pref.onlyUnvisited?'checked':''} onchange="pref.onlyUnvisited=this.checked;savePref();render()"> 未巡回のみ表示（再開）</label>
   <select style="width:auto" onchange="pref.mode=this.value;savePref();render()">${Object.entries(TRAVEL_MODES).map(([k,v])=>`<option value="${k}" ${k===pref.mode?'selected':''}>${v}</option>`).join('')}</select></div>`;
   if(pref.area){const r=routes[pref.area],pl=r?.plan;
@@ -522,7 +536,7 @@ function render(){
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
   else if(pt)html+=`<div class="card"><b>🎉 巡回プラン完了</b><div class="sub">最後は駅へ戻りましょう。続けて回る場合は、軒数を選んで再度ルートを作成できます。</div>${pr.station?`<div class="row"><a class="btn p" href="${stationNav(pr.station)}" target="_blank" rel="noopener">${esc(pr.station.name)}へ戻るナビ</a></div>`:''}</div>`;
   else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
-  const flat=!pref.area&&!!routes['']?.plan,gname=s=>flat?'巡回ルート（すべてのエリア）':s.area,groups={};list.forEach(s=>(groups[gname(s)]=groups[gname(s)]||[]).push(s));
+  const flat=!!pref.sort||(!pref.area&&!!routes['']?.plan),gname=s=>flat?(pref.sort?SORTS[pref.sort]:'巡回ルート（すべてのエリア）'):s.area,groups={};list.forEach(s=>(groups[gname(s)]=groups[gname(s)]||[]).push(s));
   Object.entries(groups).forEach(([a,l])=>{html+=`<div class="grp"><h2>${esc(a)}${flat?'':'エリア'} <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')+'</div>'});
   html+=`<h2>データ管理</h2><div class="card">
    <textarea id="csvin" rows="3" placeholder="CSVの中身（識別番号,名称,住所）を貼り付け"></textarea>
