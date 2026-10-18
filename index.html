@@ -154,17 +154,33 @@ function importCSVText(){
 
 /* ---- バックアップ（クリップボードの文字列） ---- */
 function backupText(){return JSON.stringify({version:2,exportedAt:new Date().toISOString(),spots,records,routes,fixes,pre:pref.pre})}
-async function copyBackup(){
-  const t=backupText();
-  try{await navigator.clipboard.writeText(t);alert('バックアップをクリップボードにコピーしました。メモアプリなどに貼り付けて保管してください。')}
-  catch(e){const b=document.getElementById('bk');b.value=t;b.focus();b.select();b.setSelectionRange(0,t.length);alert('自動コピーできませんでした。表示された文字列を全選択してコピーしてください。')}
+const b64=u=>{let t='';for(let i=0;i<u.length;i+=8192)t+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(t)};
+const unb64=t=>Uint8Array.from(atob(t),c=>c.charCodeAt(0));
+async function pipe(kind,input){const st=new (kind==='gz'?CompressionStream:DecompressionStream)('gzip'),w=st.writable.getWriter();w.write(input);w.close();return new Uint8Array(await new Response(st.readable).arrayBuffer())}
+async function packBackup(){return 'PB1:'+b64(await pipe('gz',new TextEncoder().encode(backupText())))}
+// 圧縮形式（PB1:…）と従来のJSON文字列の両方を読み込む
+async function parseBackup(t){t=t.trim();if(t.startsWith('PB1:'))return JSON.parse(new TextDecoder().decode(await pipe('un',unb64(t.slice(4).replace(/\s+/g,'')))));return JSON.parse(t)}
+async function copyBackup(legacy){
+  let t='';
+  const make=async()=>{t=backupText();if(!legacy){try{t=await packBackup()}catch(e){}}return new Blob([t],{type:'text/plain'})};
+  try{ // iPhoneはタップ直後でないとコピーできないため、ClipboardItemにPromiseを渡す
+    if(window.ClipboardItem&&navigator.clipboard.write)await navigator.clipboard.write([new ClipboardItem({'text/plain':make()})]);
+    else{await make();await navigator.clipboard.writeText(t)}
+    alert((t.startsWith('PB1:')?'圧縮した':(legacy?'従来形式の':'（この端末では圧縮できないため従来形式の）'))+'バックアップをコピーしました（'+t.length+'文字）。LINEのKeepメモやメモアプリに貼り付けて保管してください。');
+  }catch(e){
+    if(!t)await make();
+    const b=document.getElementById('bk');b.value=t;b.focus();b.select();b.setSelectionRange(0,t.length);alert('自動コピーできませんでした。表示された文字列を全選択してコピーしてください。');
+  }
 }
-function restoreBackup(){
+async function restoreBackup(){
   const t=document.getElementById('bk').value.trim();
-  try{const d=JSON.parse(t);if(!Array.isArray(d.spots)||typeof d.records!=='object')throw 0;
+  try{
+    const d=await parseBackup(t);if(!Array.isArray(d.spots)||typeof d.records!=='object')throw 0;
     if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))return;
-    spots=d.spots;records=d.records;migrateDone(localDate(d.exportedAt));routes=d.routes||{};fixes=d.fixes||{};save(FIX_KEY,fixes);pref.pre=d.pre||{};savePref();applyFixes();
-    save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);render();alert(`復元しました。地点 ${spots.length}件、巡回済み ${spots.filter(x=>doneToday(x.id)).length}件`);
+    spots=d.spots;records=d.records;migrateDone(localDate(d.exportedAt));routes=d.routes||{};fixes=d.fixes||{};
+    pref.pre=d.pre||{};savePref();applyFixes();
+    save(SPOTS_KEY,spots);save(RECORDS_KEY,records);save(ROUTES_KEY,routes);save(FIX_KEY,fixes);render();
+    alert(`復元しました。地点 ${spots.length}件、巡回済み ${spots.filter(x=>doneToday(x.id)).length}件`);
   }catch(e){alert('バックアップの文字列が正しくありません。全体をコピーできているか確認してください。')}
 }
 
@@ -215,7 +231,7 @@ function optimize(start,items,loop){
   return P.slice(1);
 }
 const stationNav=st=>'https://www.google.com/maps/dir/?api=1&destination='+st.lat+','+st.lng+'&travelmode='+pref.mode;
-function planNo(sp){const p=routes[sp.area]?.plan;const i=p&&p.at===today()?p.ids.indexOf(sp.id):-1;return i<0?'':`<span class="badge">巡回${i+1}</span>`}
+function planNo(sp){const p=routes[pref.area?sp.area:'']?.plan;const i=p&&p.at===today()?p.ids.indexOf(sp.id):-1;return i<0?'':`<span class="badge">巡回${i+1}</span>`}
 // 巡回プラン：未巡回の地点から基点駅に近い順にN軒を選び、駅→各地点→駅の往復で巡回順を最適化する
 async function makePlan(){
   const a=pref.area;if(!a||window._busy)return;window._busy=1;
@@ -248,7 +264,7 @@ async function makePlan(){
 function normEdit(){editList=[...editList.filter(e=>e.on),...editList.filter(e=>!e.on)]} // 選択済みを上に（上から巡回順）
 function startEdit(){
   const a=pref.area,r=routes[a],pt=r?.plan&&r.plan.at===today();
-  editList=ordSpots().filter(s=>s.area===a).map(s=>({id:s.id,on:pt?r.plan.ids.includes(s.id):pending(s.id)}));
+  editList=ordSpots().filter(s=>!a||s.area===a).map(s=>({id:s.id,on:pt?r.plan.ids.includes(s.id):pending(s.id)}));
   normEdit();render();
 }
 function editAll(on){editList.forEach(e=>e.on=on);normEdit();render()}
@@ -319,7 +335,7 @@ async function openMap(){
     const pts=mapSpots.map(s=>[pos(s).lat,pos(s).lng]);
     const stn=routes[a]?.station;if(stn)pts.push([stn.lat,stn.lng]);
     mapMap.fitBounds(L.latLngBounds(pts),{padding:[30,30]});
-    mapView=!a;['mundo','mclr','msave'].forEach(i=>document.getElementById(i).classList.toggle('hide',mapView));
+    mapView=false;['mundo','mclr','msave'].forEach(i=>document.getElementById(i).classList.toggle('hide',mapView));
     drawMap(miss);
   }catch(e){alert('地図を開けませんでした。\n'+e.message)}
   window._busy=0;
@@ -435,7 +451,9 @@ function setPre(v){pref.pre=pref.pre||{};pref.pre[pref.area]=v.trim();savePref()
 function resetRoute(){delete routes[pref.area];save(ROUTES_KEY,routes);render()}
 // 表示順：エリアはCSV登場順、エリア内は最適化済みならその順、未作成ならCSV順
 function orderIdx(s){const o=routes[s.area]?.order;const i=o?o.indexOf(s.id):-1;return i<0?1e6+s.order:i}
-function ordSpots(){const ar=areas();return spots.slice().sort((x,y)=>ar.indexOf(x.area)-ar.indexOf(y.area)||orderIdx(x)-orderIdx(y))}
+function ordSpots(){ // 「すべてのエリア」では全体ルート(routes[''])の順を優先
+  const ar=areas(),g=pref.area===''?routes['']?.order:null,gi=id=>{const i=g?g.indexOf(id):-1;return i<0?1e6:i};
+  return spots.slice().sort((x,y)=>gi(x.id)-gi(y.id)||ar.indexOf(x.area)-ar.indexOf(y.area)||orderIdx(x)-orderIdx(y))}
 
 /* ---- 画面 ---- */
 function areas(){return [...new Set(spots.map(s=>s.area))]}
@@ -477,7 +495,7 @@ function render(){
   const app=document.getElementById('app');
   const list=visible(),scope=ordSpots().filter(s=>!pref.area||s.area===pref.area);
   const total=scope.length,dn=scope.filter(s=>doneToday(s.id)).length;
-  const pr=pref.area&&routes[pref.area],pt=pr?.plan&&pr.plan.at===today();
+  const pr=routes[pref.area||''],pt=pr?.plan&&pr.plan.at===today();
   const pp=pt?pr.plan.ids.filter(id=>pending(id)):[];
   const next=pt?(pp.length?scope.find(s=>s.id===pp[0]):null):scope.find(s=>pending(s.id));
   let html=`<h1>巡回管理</h1>
@@ -496,18 +514,21 @@ function render(){
     <input type="text" id="stn" placeholder="基点の駅名（空欄なら最寄り駅を自動取得）" value="${esc(r?.station?.manual||'')}" style="margin-top:8px">
     <div class="row"><button class="p" onclick="makePlan()">駅から往復ルートを作る</button><button onclick="startEdit()">ルートを手動で決める</button>${r?.station?`<a class="btn" href="${stationNav(r.station)}" target="_blank" rel="noopener">駅へ戻るナビ</a>`:''}${pl?`<button onclick="resetRoute()">CSV順に戻す</button>`:''}</div>
     <div class="sub" id="st"></div></div>${editList?editHTML():''}`}
-  else if(spots.length)html+=`<div class="card sub">エリアを選ぶと「巡回プラン」（往復ルート作成・手動ルート）が使えます。「地図で確認」はエリアを選ぶと、印をタップしてルートも選べます。</div>`;
+  else if(spots.length){const r=routes[''],pl=r?.plan;
+    html+=`<div class="card"><b>巡回プラン（すべてのエリア）</b>
+    <div class="sub">${pl?`${pl.ids.length}軒（${pl.at.replace(/-/g,'/')}作成）`:'未作成です。'}　「地図で確認」で印をタップするか、下のボタンでルートを決められます。駅からの往復ルートの自動作成は、エリアを選ぶと使えます。</div>
+    <div class="row"><button class="p" onclick="startEdit()">ルートを手動で決める</button>${pl?`<button onclick="resetRoute()">順番を元に戻す</button>`:''}</div></div>${editList?editHTML():''}`}
   if(!spots.length)html+=`<div class="card">地点がありません。下の「データ管理」でCSVの中身を貼り付けて登録してください。</div>`;
   if(next)html+=`<h2>【次の目的地】</h2>${spotCard(next,true)}`;
   else if(pt)html+=`<div class="card"><b>🎉 巡回プラン完了</b><div class="sub">最後は駅へ戻りましょう。続けて回る場合は、軒数を選んで再度ルートを作成できます。</div>${pr.station?`<div class="row"><a class="btn p" href="${stationNav(pr.station)}" target="_blank" rel="noopener">${esc(pr.station.name)}へ戻るナビ</a></div>`:''}</div>`;
   else if(total)html+=`<div class="card">🎉 ${pref.area||'すべて'}の巡回が完了しました。</div>`;
-  const groups={};list.forEach(s=>(groups[s.area]=groups[s.area]||[]).push(s));
-  Object.entries(groups).forEach(([a,l])=>{html+=`<div class="grp"><h2>${esc(a)}エリア <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')+'</div>'});
+  const flat=!pref.area&&!!routes['']?.plan,gname=s=>flat?'巡回ルート（すべてのエリア）':s.area,groups={};list.forEach(s=>(groups[gname(s)]=groups[gname(s)]||[]).push(s));
+  Object.entries(groups).forEach(([a,l])=>{html+=`<div class="grp"><h2>${esc(a)}${flat?'':'エリア'} <span class="sub">（${l.filter(s=>doneToday(s.id)).length}/${l.length}）</span></h2>`+l.map(s=>spotCard(s,false)).join('')+'</div>'});
   html+=`<h2>データ管理</h2><div class="card">
    <textarea id="csvin" rows="3" placeholder="CSVの中身（識別番号,名称,住所）を貼り付け"></textarea>
    <div class="row"><button class="p" onclick="importCSVText()">貼り付けたCSVで地点を登録</button><button onclick="copyCSV()">地点リストをCSVでコピー</button></div>
    <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
-   <div class="row"><button onclick="copyBackup()">バックアップをコピー</button><button onclick="restoreBackup()">貼り付けた文字列から復元</button></div>
+   <div class="row"><button onclick="copyBackup()">バックアップをコピー（圧縮）</button><button onclick="copyBackup(true)">従来形式でコピー</button><button onclick="restoreBackup()">貼り付けた文字列から復元</button></div>
    <textarea id="bk" rows="3" style="margin-top:8px" placeholder="復元するときは、バックアップの文字列をここに貼り付けてください"></textarea>
    <div class="sub" style="margin-top:8px">データはこの端末内のみに保存されます。機種変更前に必ずバックアップをコピーしてメモ等に保管してください。</div></div>`;
   const ds=pref.detail&&spots.find(s=>s.id===pref.detail);
